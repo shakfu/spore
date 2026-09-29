@@ -53,3 +53,11 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Build outputs
+build/
+build-*/
+
+# Python
+__pycache__/
+.pytest_cache/

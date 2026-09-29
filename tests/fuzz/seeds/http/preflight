@@ -1,0 +1,5 @@
+OPTIONS /v1/x HTTP/1.1
+Host: [::1]:80
+Origin: https://app.localhost
+Access-Control-Request-Method: POST
+

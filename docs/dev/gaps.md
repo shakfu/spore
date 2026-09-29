@@ -1,0 +1,35 @@
+# Known gaps
+
+Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are in [design.md](design.md), not here.
+
+## Security and robustness
+
+| Gap | Effect | Suggested fix |
+|---|---|---|
+| Fuzzing not in CI | `make fuzz-run` exists but runs only by hand; the two targets have had about 150 s each | Run it in CI with a time budget; keep a persistent corpus |
+| Connection state machine not fuzzed | The fuzz targets cover the parsers only. Framing across reads, pipelining, `100-continue` and draining in `conn_service()` are covered only by the integration tests | A target that drives `spore_poll()` over a socketpair with fuzzed byte streams and split points |
+| Unbounded response buffer | `spore_write()` never refuses data. A client that stops reading while a worker streams makes `out` grow. Growth is bounded only by `max_tokens` | Return -1 (or block) above a per-response cap |
+| Partial routes on OOM | If `spore_route()` fails partway through `spore_llm_new()`, the routes already added keep a pointer to the freed handle | Register all routes before any other allocation that can fail, or add route removal |
+| Half-close aborts responses | A client that sends its request and then `shutdown(SHUT_WR)`s reads EOF. The loop treats this as a disconnect and cancels the response | Treat EOF as a close only when no response is active |
+| Hang-up missed with a full buffer | When the input buffer is full, the loop does not read. A `POLLHUP` then goes undetected until the response ends | Check `POLLHUP` separately from reads |
+
+## Clean-room verification
+
+The code was drafted by an AI model that may have seen Mongoose in training (see [PROVENANCE.md](../../PROVENANCE.md)). No token-similarity check has been run yet. Run [JPlag](https://github.com/jplag/JPlag) against `mongoose.c` before a release.
+
+## HTTP server
+
+- **Static files are read whole.** `spore_serve_dir()` loads each file into memory. It suits UI assets, not large media. Fix: stream in chunks, or use `sendfile()`.
+- **Timeouts fire up to 1 s late.** `spore_poll()` caps its wait at 1 s instead of computing the next deadline.
+- **No Windows support.** Porting needs `WSAPoll`, a socketpair in place of the self-pipe, and a peer-credential check for named pipes.
+- **No conditional or range requests.** Static files get no `ETag`, `If-Modified-Since` or `Range` handling.
+
+## LLM layer
+
+- **One prompt-cache slot.** The llama backend caches only the most recent token sequence. Two clients with interleaved conversations evict each other and fall back to full evaluation. llama-server keeps one cache per slot (`-np`).
+- **No context shift.** A conversation that fills `n_ctx` ends with `finish_reason: "length"`; nothing is discarded to make room.
+- **No batching.** One context behind a mutex. `workers > 1` gains nothing with `spore_llama`.
+- **`<think>` blocks stay in `content`.** llama-server moves them to `reasoning_content`. The parsing depends on the model.
+- **Unsupported request features:** tool calls, image and audio content, `n > 1`, logprobs, token-array inputs to embeddings.
+- **Generic backend errors.** The backend API has no error message. A prompt longer than the context returns 500 "generation failed", not a 400 that names the cause.
+- **Embeddings are printed with 17 digits.** Float vectors go out at double precision. That matches llama-server, but `%.9g` would round-trip float32 in about half the bytes. `encoding_format: "base64"` already avoids the cost.

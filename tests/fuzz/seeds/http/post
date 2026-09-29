@@ -1,0 +1,9 @@
+POST /v1/chat/completions?x=1&a=b%20c HTTP/1.1
+Host: 127.0.0.1
+Origin: http://localhost:5173
+Content-Type: application/json
+Content-Length: 2
+Connection: keep-alive, close
+Authorization: Bearer t
+
+{}
