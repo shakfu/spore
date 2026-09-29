@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT */
 #include "spore_llm.h"
 #include "spore_json.h"
+#include "internal.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -509,20 +510,6 @@ static void run_generate(spore_llm *llm, job *j) {
     spore_buf_free(&g.acc);
 }
 
-static void base64(spore_buf *b, const unsigned char *p, size_t n) {
-    static const char tab[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for (size_t i = 0; i < n; i += 3) {
-        unsigned long v = (unsigned long)p[i] << 16;
-        if (i + 1 < n) v |= (unsigned long)p[i + 1] << 8;
-        if (i + 2 < n) v |= p[i + 2];
-        char q[4] = {tab[v >> 18 & 63], tab[v >> 12 & 63],
-                     i + 1 < n ? tab[v >> 6 & 63] : '=',
-                     i + 2 < n ? tab[v & 63] : '='};
-        spore_buf_add(b, q, 4);
-    }
-}
-
 static void run_embed(spore_llm *llm, job *j) {
     const spore_json *d = &j->doc;
     size_t dim = llm->be.embed_dim;
@@ -562,7 +549,7 @@ static void run_embed(spore_llm *llm, job *j) {
                 for (int s = 0; s < 4; s++) raw[k * 4 + s] = (unsigned char)(u >> (8 * s));
             }
             spore_buf_puts(&b, "\"");
-            base64(&b, raw, dim * 4);
+            spore__base64(&b, raw, dim * 4);
             spore_buf_puts(&b, "\"");
             free(raw);
         } else {

@@ -28,7 +28,7 @@ CORS preflights from allowed origins are answered automatically. TLS is not supp
 make              # build/libspore.a, build/spored
 make test         # unit tests, fuzz seed replay, pytest integration (needs uv)
 make asan tsan    # the same suites under sanitizers
-make fuzz-run     # libFuzzer on the HTTP and JSON parsers (clang), FUZZ_TIME=60
+make fuzz-run     # libFuzzer on the HTTP, JSON and WebSocket parsers (clang), FUZZ_TIME=60
 make llama        # build/spored-llama, LLAMA_DIR=path/to/llama.cpp
 make test-llama   # end-to-end with real GGUF models, MODELS=dir
 ```
@@ -60,6 +60,36 @@ Other pieces:
 - `spore_poll()` runs one iteration, for embedding in a host's own loop.
 - `spore_serve_dir()` serves static files.
 - `spore_json.h` provides an in-place JSON reader and escaping writers.
+
+## WebSockets
+
+`spore_ws.h` is optional. With static linking, `ws.o` and `sha1.o` are linked only if it is used.
+
+```c
+static void on_message(spore_ws *ws, int type, const char *data, size_t len, void *ud) {
+    spore_ws_send(ws, type, data, len);          /* echo */
+}
+static void on_close(spore_ws *ws, int code, void *ud) { spore_ws_release(ws); }
+
+static void upgrade(spore_req *req, spore_resp *resp, void *ud) {
+    spore_ws_accept(req, resp, &(spore_ws_config){.on_message = on_message,
+                                                  .on_close = on_close}, NULL);
+}
+```
+
+Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy.
+
+The upgrade request passes the same Host, Origin and token checks as any other request. The Origin check matters most here, because browsers apply no CORS to WebSockets.
+
+Measured on one core over loopback, with a Python client:
+
+| Test | Result |
+|---|---|
+| Echo round trip, 640 B binary | 37 us p50, 43 us p99 |
+| Producer thread to client, 640 B frames | 280k frames/s |
+| Producer thread to client, 16 KB frames | 850 MB/s |
+
+Not supported: extensions (including `permessage-deflate`), server-initiated pings, and bearer tokens from browsers. Browsers cannot set `Authorization` on a WebSocket.
 
 ## LLM endpoints
 

@@ -13,6 +13,8 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 - [ ] Multiple cache slots in `backends/llama`, so interleaved conversations do not evict each other.
 - [ ] Register LLM routes so that an allocation failure in `spore_llm_new()` cannot leave routes pointing at a freed handle.
 - [ ] Run `make fuzz-run` in CI with a time budget.
+- [ ] Run the Autobahn WebSocket testsuite against `/ws/echo`.
+- [ ] Server-initiated WebSocket pings with a pong deadline, to detect dead audio peers.
 
 ## Medium
 
@@ -20,6 +22,7 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 - [ ] Keep a response alive after the client half-closes (EOF with an active response).
 - [ ] Return backend error messages, so a prompt longer than the context gets a 400 that names the cause.
 - [ ] Separate `<think>` output into `reasoning_content`.
+- [ ] Bearer token for browser WebSocket clients (via `Sec-WebSocket-Protocol`).
 - [ ] Compute the poll timeout from the nearest deadline instead of capping at 1 s.
 
 ## Low

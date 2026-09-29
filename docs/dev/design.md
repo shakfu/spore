@@ -46,3 +46,11 @@ Number parsing and printing swap the locale radix, because `strtod` and `printf`
 ## Stop sequences and UTF-8 in the API layer
 
 Token boundaries match neither stop strings nor UTF-8 sequences. Handling both in `llm.c` means each backend only emits raw bytes. The emitter holds back the longest tail that could begin a stop string, plus any incomplete UTF-8 sequence. The JSON writer replaces invalid UTF-8 with U+FFFD, so the output is always valid JSON.
+
+## WebSockets on a generic upgrade hook
+
+The core knows nothing about WebSocket framing. `spore__upgrade()` sends the 101 response and hands the connection's raw input to a callback. The existing response object carries all output. That object is already thread-safe and wakes the loop, so frames can come from any thread with no second queue. The module is optional in practice, not just in name. The core gains 93 lines, and `ws.c` plus `sha1.c` link only when used.
+
+A close frame is written and the stream finished under one lock (`spore__write2(..., end)`). Checking a "closing" flag before each write would leave a gap. In that gap another thread's data frame could land after the close frame, which RFC 6455 forbids.
+
+After sending a close frame, spore closes TCP once the frame is flushed and discards further input. It does not wait for the peer's close reply. RFC 6455 section 7.1.1 lets the server close first. Waiting would need a close timer, and the peer's reply carries nothing spore uses.

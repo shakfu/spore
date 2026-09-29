@@ -1,6 +1,7 @@
 /* JSON reader and writer (RFC 8259).
  * SPDX-License-Identifier: MIT */
 #include "spore_json.h"
+#include "internal.h"
 
 #include <locale.h>
 #include <math.h>
@@ -307,6 +308,20 @@ static size_t utf8_len(const unsigned char *s, size_t n) {
     }
     if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
     return len;
+}
+
+int spore__utf8_valid(const char *s, size_t n) {
+    const unsigned char *p = (const unsigned char *)s, *end = p + n;
+    while (p < end) {
+        if (*p < 0x80) {
+            p++;
+            continue;
+        }
+        size_t k = utf8_len(p, (size_t)(end - p));
+        if (!k) return 0;
+        p += k;
+    }
+    return 1;
 }
 
 void spore_json_str(spore_buf *b, const char *s, size_t len) {

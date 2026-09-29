@@ -65,6 +65,8 @@ typedef struct {
     int64_t t_start;   /* first byte of the pending request, 0 if none */
     int64_t t_active;  /* last I/O */
     spore_resp *resp;
+    spore__upgrade_hooks up; /* set once upgraded: input goes to up.on_data */
+    size_t up_max;           /* input buffer bound after the upgrade */
 } conn;
 
 typedef struct {
@@ -90,6 +92,7 @@ struct spore_server {
     conn **conns;
     size_t n_conns;
     struct pollfd *pfds;
+    conn *dispatching; /* connection whose handler is running */
 };
 
 /* Set while a thread runs spore_poll(); lets responses skip the wake-up
@@ -190,6 +193,14 @@ static void release(spore_resp *r) {
     spore_buf_free(&r->out);
     free(r);
 }
+
+void spore__resp_retain(spore_resp *r) {
+    pthread_mutex_lock(&r->mu);
+    r->refs++;
+    pthread_mutex_unlock(&r->mu);
+}
+
+void spore__resp_release(spore_resp *r) { release(r); }
 
 /* Caller holds r->mu; drops the handler's reference. */
 static void finish(spore_resp *r) {
@@ -298,6 +309,32 @@ int spore_end(spore_resp *r) {
     return ok ? 0 : -1;
 }
 
+int spore__write2(spore_resp *r, const void *a, size_t alen, const void *b,
+                  size_t blen, int end) {
+    pthread_mutex_lock(&r->mu);
+    int ok = r->state == RS_STREAM && !r->closed && !r->out.err;
+    if (ok && !r->head_only) {
+        if (r->chunked) spore_buf_printf(&r->out, "%zx\r\n", alen + blen);
+        spore_buf_add(&r->out, a, alen);
+        spore_buf_add(&r->out, b, blen);
+        if (r->chunked) spore_buf_puts(&r->out, "\r\n");
+        if (r->srv) wake(r->srv);
+    }
+    if (end && r->state != RS_DONE) {
+        finish(r); /* unlocks and drops the handler's reference */
+        return ok ? 0 : -1;
+    }
+    pthread_mutex_unlock(&r->mu);
+    return ok ? 0 : -1;
+}
+
+size_t spore__pending(spore_resp *r) {
+    pthread_mutex_lock(&r->mu);
+    size_t n = r->out.len - r->off;
+    pthread_mutex_unlock(&r->mu);
+    return n;
+}
+
 int spore_closed(spore_resp *r) {
     pthread_mutex_lock(&r->mu);
     int c = r->closed;
@@ -325,6 +362,36 @@ static spore_resp *resp_new(spore_server *s, const spore_req *req, int keep) {
     return r;
 }
 
+spore_resp *spore__resp_detached(void) {
+    spore_resp *r = resp_new(NULL, NULL, 0);
+    if (r) r->state = RS_STREAM;
+    return r;
+}
+
+int spore__upgrade(spore_resp *r, const char *extra,
+                   const spore__upgrade_hooks *hooks, size_t max_in) {
+    spore_server *s = r->srv; /* written only by the loop thread */
+    if (!s || tl_loop != s || !s->dispatching || s->dispatching->resp != r)
+        return -1;
+    pthread_mutex_lock(&r->mu);
+    int ok = r->state == RS_NEW && !r->closed;
+    if (ok) {
+        spore_buf_puts(&r->out, "HTTP/1.1 101 Switching Protocols\r\n");
+        spore_buf_add(&r->out, r->hdrs.ptr, r->hdrs.len);
+        if (extra) spore_buf_puts(&r->out, extra);
+        spore_buf_puts(&r->out, "\r\n");
+        r->state = RS_STREAM;
+        r->chunked = 0;
+        r->keep_alive = 0;
+        r->head_only = 0;
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (!ok) return -1;
+    s->dispatching->up = *hooks;
+    s->dispatching->up_max = max_in;
+    return 0;
+}
+
 /* ---- connections ------------------------------------------------------ */
 
 /* The loop gives up its reference; the handler may still hold one. */
@@ -341,6 +408,7 @@ static void detach(conn *c, int closed) {
 
 static void conn_free(conn *c) {
     detach(c, 1);
+    if (c->up.on_close) c->up.on_close(c->up.ctx);
     close(c->fd);
     free(c->in);
     free(c);
@@ -468,7 +536,9 @@ static void dispatch(spore_server *s, conn *c, spore_req *req) {
             return;
         }
         c->resp = r;
+        s->dispatching = c;
         rt->fn(req, r, rt->ud);
+        s->dispatching = NULL;
         return;
     }
     simple_reply(s, c, req, path_hit ? 405 : 404, keep, NULL);
@@ -518,6 +588,7 @@ static int want_write(conn *c) {
 
 static size_t in_limit(spore_server *s, conn *c) {
     if (c->draining) return IN_INITIAL;
+    if (c->up.on_data) return c->up_max;
     return c->head_len ? c->need + 1 : s->cfg.max_header + 1;
 }
 
@@ -554,8 +625,28 @@ static int conn_read(spore_server *s, conn *c, int64_t now) {
     }
 }
 
+/* Upgraded connection: flush, hand input to the hook, flush its replies. */
+static int serve_upgraded(conn *c, int64_t now) {
+    for (int pass = 0; pass < 2; pass++) {
+        int rc = flush(c, now);
+        if (rc < 0) return -1;
+        if (rc == 1) { /* protocol finished: close after the last byte */
+            detach(c, 0);
+            start_drain(c, now);
+            return 0;
+        }
+        if (pass || !c->in_len) return 0;
+        long n = c->up.on_data(c->up.ctx, c->in, c->in_len);
+        if (n < 0) return -1;
+        memmove(c->in, c->in + n, c->in_len - (size_t)n);
+        c->in_len -= (size_t)n;
+    }
+    return 0;
+}
+
 static int conn_service(spore_server *s, conn *c, int64_t now) {
     for (;;) {
+        if (c->up.on_data && c->resp) return serve_upgraded(c, now);
         if (c->resp) {
             int rc = flush(c, now);
             if (rc < 0) return -1;

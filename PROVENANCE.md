@@ -17,4 +17,6 @@ It was written as a clean-room replacement for a Mongoose-derived server (`nanos
 | OpenAI API shapes | [OpenAI API reference](https://platform.openai.com/docs/api-reference) |
 | llama-server defaults | [llama.cpp server README](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (MIT) |
 | llama.cpp backend | `llama.h` public API (MIT) |
+| WebSocket | [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455) |
+| SHA-1 | [FIPS 180-4 section 6.1](https://csrc.nist.gov/pubs/fips/180-4/upd1/final) |
 | POSIX interfaces | POSIX.1-2008 |

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-#include "spore.h"
+#include "internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,4 +57,19 @@ void spore_buf_printf(spore_buf *b, const char *fmt, ...) {
 void spore_buf_free(spore_buf *b) {
     free(b->ptr);
     memset(b, 0, sizeof *b);
+}
+
+/* RFC 4648 section 4, with padding. */
+void spore__base64(spore_buf *b, const unsigned char *p, size_t n) {
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned long v = (unsigned long)p[i] << 16;
+        if (i + 1 < n) v |= (unsigned long)p[i + 1] << 8;
+        if (i + 2 < n) v |= p[i + 2];
+        char q[4] = {tab[v >> 18 & 63], tab[v >> 12 & 63],
+                     i + 1 < n ? tab[v >> 6 & 63] : '=',
+                     i + 2 < n ? tab[v & 63] : '='};
+        spore_buf_add(b, q, 4);
+    }
 }

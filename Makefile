@@ -6,7 +6,8 @@ CPPFLAGS += -Iinclude
 LDLIBS   += -lpthread -lm
 BUILD    ?= build
 
-SRC  = src/buf.c src/http.c src/json.c src/server.c src/static.c src/llm.c
+SRC  = src/buf.c src/http.c src/json.c src/server.c src/static.c src/llm.c \
+       src/sha1.c src/ws.c
 OBJ  = $(SRC:src/%.c=$(BUILD)/%.o)
 HDRS = $(wildcard include/*.h) src/internal.h
 EX   = $(BUILD)/spored.o $(BUILD)/echo_backend.o
@@ -45,17 +46,18 @@ unit: $(BUILD)/test_unit
 	$(BUILD)/test_unit
 
 integration: $(BUILD)/spored
-	SPORED=$(BUILD)/spored uv run --no-project --with pytest --with openai pytest -q tests
+	SPORED=$(BUILD)/spored uv run --no-project --with pytest --with openai --with websockets pytest -q tests
 
 # Seed corpus through the fuzz targets with any compiler; see `fuzz` below.
-FUZZ_SRC = src/buf.c src/http.c src/json.c
+FUZZ_SRC = src/buf.c src/http.c src/json.c src/server.c src/sha1.c src/ws.c
 $(BUILD)/replay_%: tests/fuzz/fuzz_%.c tests/fuzz/replay.c $(FUZZ_SRC) $(HDRS) | $(BUILD)
 	$(CC) -std=c11 -Wall -Wextra $(CFLAGS) $(CPPFLAGS) -Isrc $< tests/fuzz/replay.c \
-		$(FUZZ_SRC) -lm -o $@
+		$(FUZZ_SRC) -lpthread -lm -o $@
 
-replay: $(BUILD)/replay_http $(BUILD)/replay_json
+replay: $(BUILD)/replay_http $(BUILD)/replay_json $(BUILD)/replay_ws
 	$(BUILD)/replay_http tests/fuzz/seeds/http/*
 	$(BUILD)/replay_json tests/fuzz/seeds/json/*
+	$(BUILD)/replay_ws tests/fuzz/seeds/ws/*
 
 SAN = -O1 -g -fno-omit-frame-pointer
 asan:
@@ -77,12 +79,12 @@ FUZZ_TIME ?= 60
 build-fuzz/fuzz_%: tests/fuzz/fuzz_%.c $(FUZZ_SRC) $(HDRS)
 	@mkdir -p build-fuzz/corpus-$*
 	$(FUZZ_CC) -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
-		-fno-sanitize-recover=undefined $(CPPFLAGS) -Isrc $< $(FUZZ_SRC) -lm -o $@
+		-fno-sanitize-recover=undefined $(CPPFLAGS) -Isrc $< $(FUZZ_SRC) -lpthread -lm -o $@
 
-fuzz: build-fuzz/fuzz_http build-fuzz/fuzz_json
+fuzz: build-fuzz/fuzz_http build-fuzz/fuzz_json build-fuzz/fuzz_ws
 
 fuzz-run: fuzz
-	for t in http json; do \
+	for t in http json ws; do \
 		build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_TIME) -dict=tests/fuzz/$$t.dict \
 			-artifact_prefix=build-fuzz/ build-fuzz/corpus-$$t tests/fuzz/seeds/$$t \
 			|| exit 1; \

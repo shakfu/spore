@@ -24,6 +24,15 @@ The code was drafted by an AI model that may have seen Mongoose in training (see
 - **No Windows support.** Porting needs `WSAPoll`, a socketpair in place of the self-pipe, and a peer-credential check for named pipes.
 - **No conditional or range requests.** Static files get no `ETag`, `If-Modified-Since` or `Range` handling.
 
+## WebSockets
+
+- **No Autobahn run.** Conformance rests on the integration tests, the `websockets` client and `fuzz_ws`. The [Autobahn testsuite](https://github.com/crossbario/autobahn-testsuite) needs Docker and has not been run.
+- **No keep-alive pings.** A peer that vanishes without a FIN is noticed only when a send fails. For a long-idle audio socket, add server-initiated pings with a pong deadline.
+- **No browser token.** Browsers cannot set `Authorization` on a WebSocket. With `spore_config.token` set, browser clients cannot connect. A token in `Sec-WebSocket-Protocol` would fix this, as some servers do.
+- **Unbounded send queue.** `spore_ws_send()` never refuses data, like `spore_write()` (see above). Real-time producers should check `spore_ws_pending()`.
+- **No extensions.** `permessage-deflate` is not offered. Compressed audio gains little from it.
+- **Text validated after reassembly.** Invalid UTF-8 in a fragmented message is detected once the message is complete, not at the first bad fragment. RFC 6455 allows this.
+
 ## LLM layer
 
 - **One prompt-cache slot.** The llama backend caches only the most recent token sequence. Two clients with interleaved conversations evict each other and fall back to full evaluation. llama-server keeps one cache per slot (`-np`).
