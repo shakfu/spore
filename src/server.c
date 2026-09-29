@@ -446,6 +446,24 @@ static int ct_equal(const char *a, size_t alen, const char *b, size_t blen) {
     return d == 0;
 }
 
+/* Browsers cannot set Authorization on a WebSocket; OpenAI's convention
+ * carries the key as the subprotocol "openai-insecure-api-key.<key>". */
+static int protocol_token(spore_str list, const char *tok, size_t tl) {
+    static const char pfx[] = "openai-insecure-api-key.";
+    size_t pl = sizeof pfx - 1;
+    const char *p = list.ptr, *end = list.ptr + list.len;
+    while (p && p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+        const char *e = p;
+        while (e < end && *e != ',' && *e != ' ' && *e != '\t') e++;
+        if ((size_t)(e - p) > pl && memcmp(p, pfx, pl) == 0 &&
+            ct_equal(p + pl, (size_t)(e - p) - pl, tok, tl))
+            return 1;
+        p = e;
+    }
+    return 0;
+}
+
 /* Access policy and framing. Returns 0 to dispatch, 1 if a reply was
  * queued, or an error status to send before closing. */
 static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
@@ -498,8 +516,12 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
     if (s->token) {
         spore_str a = spore_header_get(req, "Authorization");
         size_t tl = strlen(s->token);
-        if (a.len < 7 || !spore__ieq((spore_str){a.ptr, 7}, "Bearer ") ||
-            !ct_equal(a.ptr + 7, a.len - 7, s->token, tl)) {
+        int ok = a.len >= 7 && spore__ieq((spore_str){a.ptr, 7}, "Bearer ") &&
+                 ct_equal(a.ptr + 7, a.len - 7, s->token, tl);
+        if (!ok)
+            ok = protocol_token(spore_header_get(req, "Sec-WebSocket-Protocol"),
+                                s->token, tl);
+        if (!ok) {
             if (simple_reply(s, c, req, 401, keep && !n,
                              "WWW-Authenticate: Bearer\r\n") < 0)
                 return 500;

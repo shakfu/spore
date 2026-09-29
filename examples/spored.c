@@ -2,10 +2,17 @@
  * SPDX-License-Identifier: MIT */
 #define _POSIX_C_SOURCE 200809L
 #include "spore.h"
-#include "spore_llm.h"
-#include "spore_ws.h"
-
+#ifdef SPORE_WITH_LLM
 #include "echo_backend.h"
+#include "spore_llm.h"
+#endif
+#ifdef SPORE_WITH_WS
+#include "spore_ws.h"
+#endif
+#ifdef SPORE_WITH_REALTIME
+#include "rt_mock_backend.h"
+#include "spore_realtime.h"
+#endif
 #ifdef SPORE_WITH_LLAMA
 #include "spore_llama.h"
 #endif
@@ -40,9 +47,10 @@ static void on_echo(spore_req *req, spore_resp *resp, void *ud) {
     spore_reply(resp, 200, type, req->body, req->body_len);
 }
 
+#ifdef SPORE_WITH_WS
 /* ---- WebSocket demos --------------------------------------------------- */
 
-static void ws_echo_message(spore_ws *ws, int type, const char *data,
+static void ws_echo_message(spore_ws *ws, int type, char *data,
                             size_t len, void *ud) {
     (void)ud;
     spore_ws_send(ws, type, data, len);
@@ -137,7 +145,7 @@ static void duplex_unref(duplex *d) {
     free(d);
 }
 
-static void duplex_message(spore_ws *ws, int type, const char *data,
+static void duplex_message(spore_ws *ws, int type, char *data,
                            size_t len, void *ud) {
     duplex *d = ud;
     pthread_mutex_lock(&d->mu);
@@ -286,6 +294,27 @@ static void on_ws_stream(spore_req *req, spore_resp *resp, void *ud) {
     }
     pthread_detach(t);
 }
+#endif /* SPORE_WITH_WS */
+
+#ifndef SPORE_WITH_LLM
+static void on_health(spore_req *req, spore_resp *resp, void *ud) {
+    (void)req;
+    (void)ud;
+    spore_reply(resp, 200, "application/json", "{\"status\":\"ok\"}", 15);
+}
+#endif
+
+static const char *const modules =
+#ifdef SPORE_WITH_WS
+    " ws"
+#endif
+#ifdef SPORE_WITH_LLM
+    " llm"
+#endif
+#ifdef SPORE_WITH_REALTIME
+    " realtime"
+#endif
+    "";
 
 static void usage(void) {
     fprintf(stderr,
@@ -296,8 +325,11 @@ static void usage(void) {
             "  --token T       require 'Authorization: Bearer T'\n"
             "  --origin O      also allow this Origin (repeatable)\n"
             "  --static DIR    serve DIR at /\n"
+#ifdef SPORE_WITH_LLM
             "  --workers N     concurrent backend calls (default 1)\n"
             "  --queue N       waiting requests before 503 (default 16)\n"
+#endif
+            "  --modules       print the compiled-in modules and exit\n"
             "  --idle-ms N     keep-alive idle timeout (default 30000)\n"
             "  --request-ms N  deadline to receive a request (default 30000)\n"
 #ifdef SPORE_WITH_LLAMA
@@ -306,13 +338,18 @@ static void usage(void) {
             "  --gpu-layers N  layers to offload (default 0)\n"
             "  --embedding     serve /v1/embeddings instead of completions\n"
 #endif
-            "Without --model the echo test backend answers.\n");
+#ifdef SPORE_WITH_LLM
+            "Without --model the echo test backend answers.\n"
+#endif
+            );
     exit(2);
 }
 
 int main(int argc, char **argv) {
     spore_config cfg = {.port = 8080};
+#ifdef SPORE_WITH_LLM
     spore_llm_config lcfg = {0};
+#endif
     const char *static_dir = NULL, *origins[16] = {0};
     size_t n_origins = 0;
 #ifdef SPORE_WITH_LLAMA
@@ -328,8 +365,14 @@ int main(int argc, char **argv) {
         else if (ARG("--token")) cfg.token = v;
         else if (ARG("--origin") && n_origins < 15) origins[n_origins++] = v;
         else if (ARG("--static")) static_dir = v;
+#ifdef SPORE_WITH_LLM
         else if (ARG("--workers")) lcfg.workers = (size_t)atoi(v);
         else if (ARG("--queue")) lcfg.queue = (size_t)atoi(v);
+#endif
+        else if (strcmp(a, "--modules") == 0) {
+            printf("core%s\n", modules);
+            return 0;
+        }
         else if (ARG("--idle-ms")) cfg.idle_ms = atoi(v);
         else if (ARG("--request-ms")) cfg.request_ms = atoi(v);
 #ifdef SPORE_WITH_LLAMA
@@ -346,7 +389,9 @@ int main(int argc, char **argv) {
     if (mcfg.n_ctx < 0) mcfg.n_ctx = mcfg.embedding ? 0 : 4096;
 #endif
 
+#ifdef SPORE_WITH_LLM
     spore_llm_backend be = echo_backend();
+#endif
 #ifdef SPORE_WITH_LLAMA
     spore_llm_backend *lb = NULL;
     if (mcfg.model_path) {
@@ -362,13 +407,27 @@ int main(int argc, char **argv) {
         fprintf(stderr, "spored: %s\n", strerror(errno));
         return 1;
     }
+    int err = 0;
+#ifdef SPORE_WITH_LLM
     spore_llm *llm = spore_llm_new(g_srv, &be, &lcfg);
-    if (!llm || spore_route(g_srv, "POST", "/echo", on_echo, NULL) ||
-        spore_route(g_srv, "GET", "/ws/echo", on_ws_echo, NULL) ||
-        spore_route(g_srv, "GET", "/ws/stream", on_ws_stream, NULL) ||
-        spore_route(g_srv, "GET", "/ws/duplex", on_ws_duplex, NULL) ||
-        (static_dir && spore_route(g_srv, "GET", "/*", on_static,
-                                   (void *)static_dir))) {
+    err |= !llm;
+#else
+    err |= spore_route(g_srv, "GET", "/health", on_health, NULL);
+#endif
+#ifdef SPORE_WITH_WS
+    err |= spore_route(g_srv, "GET", "/ws/echo", on_ws_echo, NULL) ||
+           spore_route(g_srv, "GET", "/ws/stream", on_ws_stream, NULL) ||
+           spore_route(g_srv, "GET", "/ws/duplex", on_ws_duplex, NULL);
+#endif
+#ifdef SPORE_WITH_REALTIME
+    spore_rt_backend rtb = rt_mock_backend();
+    spore_rt *rt = spore_rt_new(g_srv, &rtb, NULL);
+    err |= !rt;
+#endif
+    err |= spore_route(g_srv, "POST", "/echo", on_echo, NULL) ||
+           (static_dir &&
+            spore_route(g_srv, "GET", "/*", on_static, (void *)static_dir));
+    if (err) {
         fprintf(stderr, "spored: setup failed\n");
         return 1;
     }
@@ -384,8 +443,13 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     int rc = spore_run(g_srv);
+#ifdef SPORE_WITH_LLM
     spore_llm_free(llm);
+#endif
     spore_free(g_srv);
+#ifdef SPORE_WITH_REALTIME
+    spore_rt_free(rt); /* after spore_free: that closes the sessions */
+#endif
 #ifdef SPORE_WITH_LLAMA
     spore_llama_free(lb);
 #endif

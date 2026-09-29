@@ -4,6 +4,8 @@
 #define SPORE_INTERNAL_H
 
 #include "spore.h"
+
+#include <stdint.h>
 #include "spore_ws.h"
 
 /* Parse a request head from buf[0..len). `scan` carries the search offset
@@ -59,6 +61,19 @@ void spore__ws_gone(spore_ws *ws);
 
 void spore__base64(spore_buf *b, const unsigned char *p, size_t n);
 int spore__utf8_valid(const char *s, size_t n);           /* json.c */
+/* Move `end` back (not below `start`) so s[..end) does not end inside a
+ * UTF-8 sequence. For streaming text in fragments. */
+size_t spore__utf8_cut(const char *s, size_t start, size_t end);
 void spore__sha1(const void *data, size_t len, unsigned char out[20]);
+
+/* ---- realtime audio (rt_audio.c) ------------------------------------- */
+
+/* Decode base64 in place; returns the decoded length, or -1. */
+long spore__base64_decode(char *s, size_t n);
+void spore__pcm16_to_float(const int16_t *in, size_t n, float *out);
+void spore__float_to_pcm16le(const float *in, size_t n, unsigned char *out);
+/* Resample a whole buffer; returns malloc'd samples (count in *out_n). */
+float *spore__resample(const float *in, size_t n, int from, int to,
+                       size_t *out_n);
 
 #endif

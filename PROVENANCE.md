@@ -15,6 +15,7 @@ It was written as a clean-room replacement for a Mongoose-derived server (`nanos
 | JSON | [RFC 8259](https://www.rfc-editor.org/rfc/rfc8259) |
 | Base64 | [RFC 4648](https://www.rfc-editor.org/rfc/rfc4648) |
 | OpenAI API shapes | [OpenAI API reference](https://platform.openai.com/docs/api-reference) |
+| OpenAI Realtime API (GA) | `openai` Python SDK 3.21.0 type definitions (`openai/types/realtime/`, Apache-2.0), [Realtime WebSocket guide](https://developers.openai.com/api/docs/guides/realtime-websocket), [server events reference](https://developers.openai.com/api/reference/resources/realtime/server-events); wire shapes only, no code |
 | llama-server defaults | [llama.cpp server README](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (MIT) |
 | llama.cpp backend | `llama.h` public API (MIT) |
 | WebSocket | [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455) |

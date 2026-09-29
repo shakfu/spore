@@ -12,7 +12,9 @@ import time
 
 import pytest
 
-from conftest import read_response
+from conftest import read_response, requires
+
+pytestmark = requires("ws")
 
 websockets = pytest.importorskip("websockets.sync.client")
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK  # noqa: E402

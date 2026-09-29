@@ -24,14 +24,48 @@ CORS preflights from allowed origins are answered automatically. TLS is not supp
 
 ## Build and test
 
+spore builds with CMake 3.21 or later. The `Makefile` is a thin frontend to `cmake` and `ctest`.
+
+Modules are chosen at compile time. The core is always built. Each module adds only its own objects to `libspore.a`:
+
+| Module | CMake option | Adds | Needs | `spored` code size |
+|---|---|---|---|---|
+| core | - | HTTP/1.1, access policy, static files, JSON | - | 33 KB |
+| `ws` | `SPORE_WS` | WebSocket (`spore_ws.h`) | core | +17 KB |
+| `llm` | `SPORE_LLM` | OpenAI-compatible chat, completions, embeddings (`spore_llm.h`) | core | +21 KB |
+| `realtime` | `SPORE_REALTIME` | OpenAI Realtime API, speech to speech (`spore_realtime.h`) | `ws` | +37 KB |
+
+Tests for modules left out are skipped. `spored --modules` lists what was built.
+
 ```sh
-make              # build/libspore.a, build/spored
-make test         # unit tests, fuzz seed replay, pytest integration (needs uv)
-make asan tsan    # the same suites under sanitizers
-make fuzz-run     # libFuzzer on the HTTP, JSON and WebSocket parsers (clang), FUZZ_TIME=60
-make llama        # build/spored-llama, LLAMA_DIR=path/to/llama.cpp
-make test-llama   # end-to-end with real GGUF models, MODELS=dir
+make                      # build/libspore.a, build/spored; MODULES="ws llm realtime" by default
+make MODULES="ws"         # choose modules
+make test                 # ctest: unit tests, fuzz seed replay, pytest integration (needs uv)
+make asan tsan            # the same suites under sanitizers
+make check-modules        # build and test every module set
+make fuzz-run             # libFuzzer on the HTTP, JSON and WebSocket parsers (clang), FUZZ_TIME=60
+make llama                # build/spored-llama, LLAMA_DIR=path/to/llama.cpp
+make test-llama           # end-to-end with real GGUF models, MODELS=dir
+make install PREFIX=...   # headers, libspore.a, CMake package
 ```
+
+The same builds without the frontend:
+
+```sh
+cmake -S . -B build -DSPORE_WS=ON -DSPORE_LLM=OFF
+cmake --build build && ctest --test-dir build
+```
+
+Other options: `SPORE_SANITIZE` (for example `address,undefined`), `SPORE_FUZZ`, `SPORE_LLAMA_DIR`, and `SPORE_BUILD_TESTS` / `SPORE_BUILD_EXAMPLES`. The last two default to on only when spore is the top-level project.
+
+To use spore from another CMake project, vendor it or install it:
+
+```cmake
+add_subdirectory(spore)          # or: find_package(spore 0.1 REQUIRED)
+target_link_libraries(app PRIVATE spore::spore)
+```
+
+`spore::spore` carries `SPORE_WITH_WS`, `SPORE_WITH_LLM` and `SPORE_WITH_REALTIME` as compile definitions, so the application can `#ifdef` on the modules it was built with.
 
 ## Library use
 
@@ -79,6 +113,13 @@ static void upgrade(spore_req *req, spore_resp *resp, void *ud) {
 
 Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy.
 
+`/ws/duplex` shows the full-duplex pattern for speech in and audio out:
+- `on_message` only copies inbound frames into a bounded queue, and a full queue drops its oldest frame.
+- A worker thread processes the queue and sends results.
+- A `cancel` text message (barge-in) empties the queue. No output from before the cancel is sent after its acknowledgement.
+
+`tests/test_ws.py` checks ordering, drop accounting and barge-in under TSan.
+
 The upgrade request passes the same Host, Origin and token checks as any other request. The Origin check matters most here, because browsers apply no CORS to WebSockets.
 
 Measured on one core over loopback, with a Python client:
@@ -89,7 +130,37 @@ Measured on one core over loopback, with a Python client:
 | Producer thread to client, 640 B frames | 280k frames/s |
 | Producer thread to client, 16 KB frames | 850 MB/s |
 
-Not supported: extensions (including `permessage-deflate`), server-initiated pings, and bearer tokens from browsers. Browsers cannot set `Authorization` on a WebSocket.
+Not supported: extensions (including `permessage-deflate`) and server-initiated pings.
+
+Browsers cannot set `Authorization` on a WebSocket. When `spore_config.token` is set, the core also accepts the token as the subprotocol `openai-insecure-api-key.<token>`, which is OpenAI's browser convention. This applies to any route. The key entry is never echoed back.
+
+## Realtime API
+
+`spore_rt_new(srv, &backend, &cfg)` serves `GET /v1/realtime` with the GA event protocol of the OpenAI Realtime API. The official SDK connects unmodified with `client.realtime.connect()`. Browsers connect with the subprotocols `realtime` and `openai-insecure-api-key.<token>`.
+
+Speech to speech runs as a pipeline of three blocking backend calls, in order on a per-session worker thread:
+
+| Step | Backend call | Audio |
+|---|---|---|
+| transcribe the committed turn | `transcribe` (for example whisper.cpp) | float at `asr_rate` |
+| generate the reply | `llm.generate`, the same interface as `spore_llm` | - |
+| speak it, sentence by sentence | `synthesize` | float at `tts_rate` |
+
+On the wire, audio is 24 kHz mono 16-bit PCM in base64. The module resamples to and from the backend rates with a windowed-sinc filter.
+
+Supported:
+- session updates;
+- `server_vad` turn detection, with an energy detector standing in for OpenAI's model-based VAD;
+- barge-in: speech during a response cancels it with `turn_detected`;
+- manual commit;
+- conversation item create, delete, retrieve and truncate;
+- text or audio output;
+- `response.cancel`;
+- input transcription events.
+
+Not supported yet: tools, G.711 formats, transcription-only sessions, out-of-band responses (`conversation: "none"`), and audio in `conversation.item.retrieved`. See [docs/dev/gaps.md](docs/dev/gaps.md).
+
+`spored` serves the mock backend in `examples/rt_mock_backend.c`: its transcripts report the audio length, it echoes the text, and it speaks a tone. Real engines come next.
 
 ## LLM endpoints
 

@@ -1,117 +1,99 @@
-CC       ?= cc
-CXX      ?= c++
-CFLAGS   ?= -O2 -g
-WARN      = -std=c11 -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes
-CPPFLAGS += -Iinclude
-LDLIBS   += -lpthread -lm
-BUILD    ?= build
+# Frontend to CMake. Build logic lives in CMakeLists.txt; this file only
+# maps short targets onto cmake/ctest invocations.
 
-SRC  = src/buf.c src/http.c src/json.c src/server.c src/static.c src/llm.c \
-       src/sha1.c src/ws.c
-OBJ  = $(SRC:src/%.c=$(BUILD)/%.o)
-HDRS = $(wildcard include/*.h) src/internal.h
-EX   = $(BUILD)/spored.o $(BUILD)/echo_backend.o
+BUILD   ?= build
+MODULES ?= ws llm realtime
+CMAKE   ?= cmake
+CTEST   ?= ctest
+JOBS    ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# Optional llama.cpp backend: make llama LLAMA_DIR=/path/to/llama.cpp
-# LLAMA_DIR must hold include/llama.h and lib/lib{llama,ggml*}.a.
-LLAMA_DIR  ?= ../cyllama/thirdparty/llama.cpp
-LLAMA_LIBS  = $(LLAMA_DIR)/lib/libllama.a $(LLAMA_DIR)/lib/libggml.a \
-              $(LLAMA_DIR)/lib/libggml-cpu.a $(LLAMA_DIR)/lib/libggml-base.a
+KNOWN_MODULES = ws llm realtime
+$(foreach m,$(MODULES),$(if $(filter $(m),$(KNOWN_MODULES)),,\
+  $(error unknown module '$(m)'; known: $(KNOWN_MODULES))))
+$(if $(and $(filter realtime,$(MODULES)),$(if $(filter ws,$(MODULES)),,x)),\
+  $(error module 'realtime' needs 'ws'))
+onoff   = $(if $(filter $(1),$(MODULES)),ON,OFF)
+CONFIG  = -DSPORE_WS=$(call onoff,ws) -DSPORE_LLM=$(call onoff,llm) \
+          -DSPORE_REALTIME=$(call onoff,realtime) $(CMAKE_ARGS)
 
-.PHONY: all test unit integration replay asan tsan fuzz fuzz-run llama test-llama clean
-
-all: $(BUILD)/libspore.a $(BUILD)/spored
-
-$(BUILD):
-	@mkdir -p $@
-
-$(BUILD)/%.o: src/%.c $(HDRS) | $(BUILD)
-	$(CC) $(WARN) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
-
-$(BUILD)/%.o: examples/%.c $(HDRS) examples/echo_backend.h | $(BUILD)
-	$(CC) $(WARN) $(CFLAGS) $(CPPFLAGS) -Iexamples -c $< -o $@
-
-$(BUILD)/libspore.a: $(OBJ)
-	$(AR) rcs $@ $^
-
-$(BUILD)/spored: $(EX) $(BUILD)/libspore.a
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
-
-$(BUILD)/test_unit: tests/test_unit.c $(BUILD)/libspore.a $(HDRS)
-	$(CC) $(WARN) $(CFLAGS) $(CPPFLAGS) -Isrc $< $(BUILD)/libspore.a $(LDLIBS) -o $@
-
-test: unit replay integration
-
-unit: $(BUILD)/test_unit
-	$(BUILD)/test_unit
-
-integration: $(BUILD)/spored
-	SPORED=$(BUILD)/spored uv run --no-project --with pytest --with openai --with websockets pytest -q tests
-
-# Seed corpus through the fuzz targets with any compiler; see `fuzz` below.
-FUZZ_SRC = src/buf.c src/http.c src/json.c src/server.c src/sha1.c src/ws.c
-$(BUILD)/replay_%: tests/fuzz/fuzz_%.c tests/fuzz/replay.c $(FUZZ_SRC) $(HDRS) | $(BUILD)
-	$(CC) -std=c11 -Wall -Wextra $(CFLAGS) $(CPPFLAGS) -Isrc $< tests/fuzz/replay.c \
-		$(FUZZ_SRC) -lpthread -lm -o $@
-
-replay: $(BUILD)/replay_http $(BUILD)/replay_json $(BUILD)/replay_ws
-	$(BUILD)/replay_http tests/fuzz/seeds/http/*
-	$(BUILD)/replay_json tests/fuzz/seeds/json/*
-	$(BUILD)/replay_ws tests/fuzz/seeds/ws/*
-
-SAN = -O1 -g -fno-omit-frame-pointer
-asan:
-	$(MAKE) BUILD=build-asan CFLAGS="$(SAN) -fsanitize=address,undefined" \
-		LDFLAGS="-fsanitize=address,undefined" test
-# setarch -R: TSan cannot map its shadow memory under high-entropy ASLR.
-tsan:
-	$(if $(shell command -v setarch),setarch $(shell uname -m) -R) \
-	$(MAKE) BUILD=build-tsan CFLAGS="$(SAN) -fsanitize=thread" \
-		LDFLAGS="-fsanitize=thread" test
-
-# ---- libFuzzer (clang) ---------------------------------------------------
-# `make fuzz-run FUZZ_TIME=600`. New corpus entries go to build-fuzz/corpus-*;
-# copy crash reproducers into tests/fuzz/seeds/ so `make test` replays them.
+# Optional llama.cpp backend (make llama / test-llama).
+LLAMA_DIR ?= ../cyllama/thirdparty/llama.cpp
+MODELS    ?= ../cyllama/models
 
 FUZZ_CC   ?= clang
 FUZZ_TIME ?= 60
+FUZZ      = build-fuzz
 
-build-fuzz/fuzz_%: tests/fuzz/fuzz_%.c $(FUZZ_SRC) $(HDRS)
-	@mkdir -p build-fuzz/corpus-$*
-	$(FUZZ_CC) -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined \
-		-fno-sanitize-recover=undefined $(CPPFLAGS) -Isrc $< $(FUZZ_SRC) -lpthread -lm -o $@
+.PHONY: all configure test unit replay integration asan tsan check-modules \
+        fuzz fuzz-run llama test-llama install clean
 
-fuzz: build-fuzz/fuzz_http build-fuzz/fuzz_json build-fuzz/fuzz_ws
+all: configure
+	$(CMAKE) --build $(BUILD) -j$(JOBS)
+
+configure:
+	@$(CMAKE) -S . -B $(BUILD) $(CONFIG) > /dev/null
+
+test: all
+	$(CTEST_PREFIX) $(CTEST) --test-dir $(BUILD) --output-on-failure -LE llama
+
+unit: all
+	$(CTEST) --test-dir $(BUILD) --output-on-failure -R '^unit$$'
+
+replay: all
+	$(CTEST) --test-dir $(BUILD) --output-on-failure -R '^replay_'
+
+integration: all
+	$(CTEST) --test-dir $(BUILD) --output-on-failure -R '^integration$$'
+
+asan:
+	$(MAKE) BUILD=build-asan \
+		CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Debug -DSPORE_SANITIZE=address,undefined" test
+
+# setarch -R: TSan cannot map its shadow memory under high-entropy ASLR.
+tsan:
+	$(MAKE) BUILD=build-tsan CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Debug -DSPORE_SANITIZE=thread" \
+		CTEST_PREFIX="$(if $(shell command -v setarch),setarch $(shell uname -m) -R)" test
+
+# Build and test each module set in its own directory.
+MODULE_SETS = core ws llm ws+llm ws+realtime ws+llm+realtime
+check-modules:
+	@for set in $(MODULE_SETS); do \
+		mods=$$(echo $$set | sed 's/core//; s/+/ /g'); \
+		echo "== MODULES='$$mods'"; \
+		$(MAKE) --no-print-directory BUILD=build-mod-$$set MODULES="$$mods" test || exit 1; \
+	done
+
+# ---- libFuzzer (clang) -------------------------------------------------------
+# New corpus entries go to build-fuzz/corpus-*; copy crash reproducers into
+# tests/fuzz/seeds/ so `make test` replays them.
+
+fuzz:
+	@$(CMAKE) -S . -B $(FUZZ) -DCMAKE_C_COMPILER=$(FUZZ_CC) -DSPORE_FUZZ=ON \
+		-DSPORE_BUILD_TESTS=OFF -DSPORE_BUILD_EXAMPLES=OFF > /dev/null
+	$(CMAKE) --build $(FUZZ) -j$(JOBS) --target fuzz_http fuzz_json fuzz_ws
 
 fuzz-run: fuzz
 	for t in http json ws; do \
-		build-fuzz/fuzz_$$t -max_total_time=$(FUZZ_TIME) -dict=tests/fuzz/$$t.dict \
-			-artifact_prefix=build-fuzz/ build-fuzz/corpus-$$t tests/fuzz/seeds/$$t \
-			|| exit 1; \
+		mkdir -p $(FUZZ)/corpus-$$t; \
+		$(FUZZ)/fuzz_$$t -max_total_time=$(FUZZ_TIME) -dict=tests/fuzz/$$t.dict \
+			-artifact_prefix=$(FUZZ)/ $(FUZZ)/corpus-$$t tests/fuzz/seeds/$$t || exit 1; \
 	done
 
-# ---- llama.cpp backend --------------------------------------------------
+# ---- llama.cpp backend -------------------------------------------------------
 
-$(BUILD)/spore_llama.o: backends/llama/spore_llama.cpp backends/llama/spore_llama.h $(HDRS) | $(BUILD)
-	$(CXX) -std=c++17 -Wall -Wextra $(CFLAGS) $(CPPFLAGS) -Ibackends/llama \
-		-I$(LLAMA_DIR)/include -c $< -o $@
+llama:
+	@$(CMAKE) -S . -B $(BUILD) $(CONFIG) -DSPORE_LLAMA_DIR=$(abspath $(LLAMA_DIR)) \
+		-DSPORE_TEST_MODELS=$(abspath $(MODELS)) > /dev/null
+	$(CMAKE) --build $(BUILD) -j$(JOBS)
 
-$(BUILD)/spored-llama.o: examples/spored.c $(HDRS) | $(BUILD)
-	$(CC) $(WARN) $(CFLAGS) $(CPPFLAGS) -Iexamples -Ibackends/llama \
-		-DSPORE_WITH_LLAMA -c $< -o $@
+test-llama: llama
+	$(CTEST) --test-dir $(BUILD) --output-on-failure -L llama
 
-$(BUILD)/spored-llama: $(BUILD)/spored-llama.o $(BUILD)/echo_backend.o \
-		$(BUILD)/spore_llama.o $(BUILD)/libspore.a
-	$(CXX) $(CFLAGS) $(LDFLAGS) $^ $(LLAMA_LIBS) $(LDLIBS) -ldl -fopenmp -o $@
+# ---- install / clean -----------------------------------------------------------
 
-llama: $(BUILD)/spored-llama
-
-MODELS ?= ../cyllama/models
-test-llama: $(BUILD)/spored-llama
-	SPORED_LLAMA=$(BUILD)/spored-llama \
-	SPORE_CHAT_MODEL=$(MODELS)/Qwen3-0.6B-Q8_0.gguf \
-	SPORE_EMBED_MODEL=$(MODELS)/bge-small-en-v1.5-q8_0.gguf \
-	uv run --no-project --with pytest --with openai pytest -q tests/test_llama.py
+PREFIX ?= /usr/local
+install: all
+	$(CMAKE) --install $(BUILD) --prefix $(PREFIX)
 
 clean:
-	rm -rf build build-asan build-tsan build-fuzz
+	rm -rf build build-asan build-tsan build-fuzz build-mod-*

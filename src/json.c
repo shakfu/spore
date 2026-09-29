@@ -324,6 +324,16 @@ int spore__utf8_valid(const char *s, size_t n) {
     return 1;
 }
 
+size_t spore__utf8_cut(const char *s, size_t start, size_t end) {
+    for (size_t k = 1; k <= 3 && k <= end - start; k++) {
+        unsigned char c = (unsigned char)s[end - k];
+        if ((c & 0xC0) == 0x80) continue; /* continuation byte */
+        size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        return need > k ? end - k : end;
+    }
+    return end;
+}
+
 void spore_json_str(spore_buf *b, const char *s, size_t len) {
     const unsigned char *p = (const unsigned char *)s, *end = p + len;
     spore_buf_add(b, "\"", 1);

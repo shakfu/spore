@@ -112,7 +112,7 @@ static void fail(spore_ws *ws, int code) {
     notify(ws, code);
 }
 
-static void deliver(spore_ws *ws, int op, const char *data, size_t len) {
+static void deliver(spore_ws *ws, int op, char *data, size_t len) {
     if (op == OP_TEXT && !spore__utf8_valid(data, len)) {
         fail(ws, 1007);
         return;
@@ -194,7 +194,7 @@ static long feed(void *ctx, char *data, size_t len) {
             if (ws->frag_type) {
                 fail(ws, 1002);
             } else if (fin) {
-                deliver(ws, op, (const char *)p, plen);
+                deliver(ws, op, (char *)p, plen);
             } else {
                 ws->frag_type = op;
                 ws->frag.len = 0;
@@ -216,7 +216,8 @@ static long feed(void *ctx, char *data, size_t len) {
             } else if (fin) {
                 int t = ws->frag_type;
                 ws->frag_type = 0;
-                deliver(ws, t, ws->frag.ptr ? ws->frag.ptr : "", ws->frag.len);
+                char empty[1] = "";
+                deliver(ws, t, ws->frag.ptr ? ws->frag.ptr : empty, ws->frag.len);
                 ws->frag.len = 0;
             }
             break;

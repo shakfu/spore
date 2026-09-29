@@ -33,7 +33,7 @@ static int valid_utf8(const unsigned char *s, size_t n) {
 
 static int closes;
 
-static void on_message(spore_ws *ws, int type, const char *data, size_t len,
+static void on_message(spore_ws *ws, int type, char *data, size_t len,
                        void *ud) {
     (void)ud;
     REQUIRE(len <= MAX_MESSAGE);

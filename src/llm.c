@@ -329,17 +329,6 @@ static const char *find(const char *h, size_t hl, const char *n, size_t nl) {
     return NULL;
 }
 
-/* Move `end` back so acc[..end) does not split a UTF-8 sequence. */
-static size_t utf8_cut(const char *s, size_t start, size_t end) {
-    for (size_t k = 1; k <= 3 && k <= end - start; k++) {
-        unsigned char c = (unsigned char)s[end - k];
-        if ((c & 0xC0) == 0x80) continue; /* continuation byte */
-        size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-        return need > k ? end - k : end;
-    }
-    return end;
-}
-
 static void chunk_head(gen *g, spore_buf *b) {
     job *j = g->j;
     spore_buf_printf(b, "{\"id\":\"%s\",\"object\":\"%s\",\"created\":%ld,"
@@ -421,7 +410,7 @@ static int emit(void *ctx, const char *text, size_t len) {
                 break;
             }
     }
-    advance(g, utf8_cut(g->acc.ptr, g->sent, g->acc.len - hold));
+    advance(g, spore__utf8_cut(g->acc.ptr, g->sent, g->acc.len - hold));
     return g->dead;
 }
 

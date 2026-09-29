@@ -27,11 +27,19 @@ The code was drafted by an AI model that may have seen Mongoose in training (see
 ## WebSockets
 
 - **No Autobahn run.** Conformance rests on the integration tests, the `websockets` client and `fuzz_ws`. The [Autobahn testsuite](https://github.com/crossbario/autobahn-testsuite) needs Docker and has not been run.
-- **No keep-alive pings.** A peer that vanishes without a FIN is noticed only when a send fails. For a long-idle audio socket, add server-initiated pings with a pong deadline.
-- **No browser token.** Browsers cannot set `Authorization` on a WebSocket. With `spore_config.token` set, browser clients cannot connect. A token in `Sec-WebSocket-Protocol` would fix this, as some servers do.
+- **No keep-alive pings.** On loopback and Unix sockets, the kernel closes a dead process's sockets, so a vanished peer is always seen. Pings would only detect a hung process, such as one stopped in a debugger. Browsers answer pings in their network stack, so a frozen tab would still pass.
 - **Unbounded send queue.** `spore_ws_send()` never refuses data, like `spore_write()` (see above). Real-time producers should check `spore_ws_pending()`.
 - **No extensions.** `permessage-deflate` is not offered. Compressed audio gains little from it.
 - **Text validated after reassembly.** Invalid UTF-8 in a fragmented message is detected once the message is complete, not at the first bad fragment. RFC 6455 allows this.
+
+## Realtime
+
+- **No fuzz target for client events.** Event parsing uses the fuzzed JSON reader, but the session state machine and base64 decoding are covered only by integration tests. A target that feeds events to a detached session would close this.
+- **Energy VAD.** Background noise above the threshold starts turns. `semantic_vad` is accepted but maps `eagerness` onto silence lengths (300/600/1200 ms).
+- **Not implemented:** tools and function calls, G.711 (`audio/pcmu`, `audio/pcma`), transcription-only sessions, out-of-band responses (`conversation: "none"`, `response.input`), `idle_timeout_ms`, input transcription deltas, and audio in `conversation.item.retrieved` (only lengths are stored).
+- **One content part per item.** Multi-part user messages are joined into one text.
+- **Per-chunk resampling of synthesized audio.** Chunks are resampled independently, so a TTS rate other than 24 kHz gets small discontinuities at chunk edges. OuteTTS produces 24 kHz, so no resampling happens there.
+- **No rate limits.** `rate_limits.updated` is never sent. Clients treat it as optional.
 
 ## LLM layer
 

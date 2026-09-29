@@ -3,7 +3,9 @@
 #include "spore_json.h"
 
 #include <locale.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures, checks;
@@ -207,12 +209,69 @@ static void test_json_write(void) {
     spore_buf_free(&b);
 }
 
+#ifdef SPORE_WITH_REALTIME
+static double rms(const float *x, size_t from, size_t to) {
+    double e = 0;
+    for (size_t i = from; i < to; i++) e += (double)x[i] * x[i];
+    return sqrt(e / (double)(to - from));
+}
+
+static void test_rt_audio(void) {
+    /* base64: round trip through the encoder, then malformed input */
+    unsigned char raw[256];
+    for (int i = 0; i < 256; i++) raw[i] = (unsigned char)i;
+    for (size_t n = 0; n <= 256; n += 37) {
+        spore_buf b = {0};
+        spore__base64(&b, raw, n);
+        spore_buf_add(&b, "", 0);
+        long got = spore__base64_decode(b.ptr ? b.ptr : (char *)"", b.len);
+        CHECK(got == (long)n && (!n || memcmp(b.ptr, raw, n) == 0));
+        spore_buf_free(&b);
+    }
+    char bad1[] = "abc", bad2[] = "ab=c", bad3[] = "a===", bad4[] = "ab!d";
+    CHECK(spore__base64_decode(bad1, 3) == -1);
+    CHECK(spore__base64_decode(bad2, 4) == -1);
+    CHECK(spore__base64_decode(bad3, 4) == -1);
+    CHECK(spore__base64_decode(bad4, 4) == -1);
+
+    /* resampling: length, DC gain, pass band, anti-aliasing */
+    enum { N = 24000 };
+    float *x = malloc(N * sizeof *x);
+    size_t m;
+    for (int i = 0; i < N; i++) x[i] = 0.5f;
+    float *y = spore__resample(x, N, 24000, 16000, &m);
+    CHECK(y && m == 16000 && fabs(y[m / 2] - 0.5) < 1e-4);
+    free(y);
+    for (int i = 0; i < N; i++) x[i] = (float)sin(2 * 3.14159265358979 * 1000 * i / 24000.0);
+    y = spore__resample(x, N, 24000, 16000, &m);
+    CHECK(y && fabs(rms(y, 1000, m - 1000) - sqrt(0.5)) < 0.01); /* 1 kHz passes */
+    free(y);
+    for (int i = 0; i < N; i++) x[i] = (float)sin(2 * 3.14159265358979 * 10000 * i / 24000.0);
+    y = spore__resample(x, N, 24000, 16000, &m);
+    CHECK(y && rms(y, 1000, m - 1000) < 0.01 * sqrt(0.5)); /* 10 kHz: >40 dB down */
+    free(y);
+    y = spore__resample(x, N, 16000, 24000, &m); /* upsampling length */
+    CHECK(y && m == 36000);
+    free(y);
+    CHECK(spore__resample(x, N, 0, 16000, &m) == NULL);
+    free(x);
+
+    float f[3] = {1.5f, -1.5f, 0.5f};
+    unsigned char pcm[6];
+    spore__float_to_pcm16le(f, 3, pcm);
+    CHECK(pcm[0] == 0xFF && pcm[1] == 0x7F && pcm[2] == 0x00 && pcm[3] == 0x80);
+}
+#endif
+
 int main(void) {
     test_parse_head();
     test_tokens_and_hosts();
     test_url();
     test_json_read();
     test_json_write();
+#ifdef SPORE_WITH_REALTIME
+    test_rt_audio();
+#endif
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures != 0;
 }

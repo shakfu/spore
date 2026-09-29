@@ -9,6 +9,10 @@ import time
 
 import pytest
 
+from conftest import requires
+
+pytestmark = requires("llm")
+
 
 def call(srv, path, payload=None, timeout=10):
     c = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=timeout)

@@ -21,9 +21,10 @@ enum { SPORE_WS_TEXT = 1, SPORE_WS_BINARY = 2 };
 /* Callbacks run on the loop thread. Zero fields take the default shown. */
 typedef struct {
     void (*on_open)(spore_ws *ws, void *ud);
-    /* `data` is valid only during the call. Text is validated UTF-8.
-     * Fragmented messages arrive whole. */
-    void (*on_message)(spore_ws *ws, int type, const char *data, size_t len,
+    /* `data` is valid only during the call and may be modified in place
+     * (e.g. by spore_json_parse). Text is validated UTF-8. Fragmented
+     * messages arrive whole. */
+    void (*on_message)(spore_ws *ws, int type, char *data, size_t len,
                        void *ud);
     /* Called once. `code` is the peer's close code, the code this side
      * sent if it closed first, 1005 if the peer sent none, or 1006 if the

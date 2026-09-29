@@ -54,3 +54,13 @@ The core knows nothing about WebSocket framing. `spore__upgrade()` sends the 101
 A close frame is written and the stream finished under one lock (`spore__write2(..., end)`). Checking a "closing" flag before each write would leave a gap. In that gap another thread's data frame could land after the close frame, which RFC 6455 forbids.
 
 After sending a close frame, spore closes TCP once the frame is flushed and discards further input. It does not wait for the peer's close reply. RFC 6455 section 7.1.1 lets the server close first. Waiting would need a close timer, and the peer's reply carries nothing spore uses.
+
+## Realtime: a pipeline behind OpenAI's event protocol
+
+OpenAI's realtime models hear audio directly. spore has no such model, so a turn runs as transcribe, then generate, then synthesize. Each session has one worker thread that runs these steps in order, because the reply needs the transcript. A shared pool would need a per-session ordering mechanism; with at most `max_conns` sessions, a thread per session is simpler.
+
+Both the loop thread (client events, VAD) and the worker send events and change session state, always under the session mutex. Barge-in sends `speech_started` and sets the response's cancel flag in one critical section. So `response.done` with `turn_detected` always follows `speech_started`, the order the spec requires.
+
+Speech is synthesized one sentence at a time, as the LLM streams text. Each sentence's transcript delta is sent just before its audio. So the transcript never runs ahead of what the client can play, and a cancelled item keeps only the words the client received.
+
+Turn detection uses 10 ms frame energy: `threshold` maps linearly onto -70..-20 dBFS, and two loud frames start speech. It is a stand-in for OpenAI's model-based VAD. The default silence is 500 ms, from the SDK docstring; the live reference shows 200 ms, which an energy detector would trip on every short pause. A model VAD (Silero, via whisper.cpp) can replace it without protocol changes.

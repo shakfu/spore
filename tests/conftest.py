@@ -8,6 +8,12 @@ from pathlib import Path
 import pytest
 
 SPORED = os.environ.get("SPORED", str(Path(__file__).parents[1] / "build" / "spored"))
+# Modules compiled into this spored; tests for absent ones are skipped.
+MODULES = set(subprocess.run([SPORED, "--modules"], capture_output=True, text=True).stdout.split())
+
+
+def requires(module):
+    return pytest.mark.skipif(module not in MODULES, reason=f"built without module '{module}'")
 
 
 class Server:
