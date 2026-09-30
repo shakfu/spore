@@ -1,6 +1,6 @@
 # TODO
 
-Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
+Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md). Items marked (net) are in [docs/dev/net-security.md](docs/dev/net-security.md).
 
 ## Critical
 
@@ -32,7 +32,21 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 
 - [ ] Fuzz target for realtime client events.
 
+- [ ] (net) Reword the scope claim in `README.md`: the listener cannot be bound elsewhere, but a forwarder on the host exposes it.
+
+- [ ] (net) `spored --token-file PATH`: generate a token, write it mode `0600`, print a URL with the token in the fragment.
+
+- [ ] (net) Deprecate `spored --token T`, or document that `ps` exposes it to other users.
+
+- [ ] (net) State in `README.md` which transport to use: the Unix socket for non-browser clients, TCP with a token for browsers and forwarders.
+
+- [ ] (net) Document a reverse-proxy setup that requires `token` and keeps the Host check effective.
+
 ## Medium
+
+- [ ] (net) Setting that disables the implicit loopback origins, so only `spore_config.origins` is accepted.
+
+- [ ] (net) Allowed-hosts setting; apply the Host check on Unix sockets when it is set.
 
 - [ ] Detect `POLLHUP` even when the input buffer is full.
 
@@ -57,3 +71,5 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 - [ ] Print embeddings at float32 precision (`%.9g`).
 
 - [ ] Windows port.
+
+- [ ] (net) Document the Docker setup: a Unix socket in a mounted volume, or `--network host`.
