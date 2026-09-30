@@ -19,7 +19,7 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 - [x] Realtime phase 3: port OuteTTS generation (cyllama's Python loop) to C++ as `synthesize`.
 - [x] Real-time TTS: measure OuteTTS-0.3-500M and GPU offload (RTX 4060: real-time factor 0.3-0.6).
 - [x] Stream the TTS vocoder in overlapping windows, to cut first-audio latency per sentence.
-- [ ] Listening test: streamed vs whole-sentence TTS (A/B WAVs from `docs/dev/design.md`'s measurement).
+- [x] Listening test: streamed vs whole-sentence TTS (3 sentences, no audible difference).
 - [ ] Fuzz target for realtime client events.
 
 ## Medium
