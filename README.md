@@ -3,7 +3,9 @@
 A minimal HTTP/1.1 server in C11 that only serves the local machine. It includes an optional OpenAI-compatible API layer, so it can stand in for `llama-server`.
 
 - MIT licensed, written from public specifications. See [PROVENANCE.md](PROVENANCE.md).
+
 - POSIX only (Linux, macOS, BSD). No dependencies beyond libc and pthreads.
+
 - 2,300 lines of C in `src/` plus 330 lines of headers. The demo server has 52 KB of code and runs in 2 MB RSS.
 
 ## Scope
@@ -85,14 +87,19 @@ int main(void) {
 ```
 
 One thread runs the event loop and calls handlers. Each handler finishes its response once, in one of two ways:
+
 - with `spore_reply()`, or
+
 - with `spore_begin()`, `spore_write()` / `spore_sse()`, then `spore_end()`.
 
 It can finish immediately, or later from any thread. Handlers never block the loop. They hand long work to their own threads, which stream results back. `spore_closed()` reports a client disconnect so that work can stop.
 
 Other pieces:
+
 - `spore_poll()` runs one iteration, for embedding in a host's own loop.
+
 - `spore_serve_dir()` serves static files.
+
 - `spore_json.h` provides an in-place JSON reader and escaping writers.
 
 ## WebSockets
@@ -114,8 +121,11 @@ static void upgrade(spore_req *req, spore_resp *resp, void *ud) {
 Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy.
 
 `/ws/duplex` shows the full-duplex pattern for speech in and audio out:
+
 - `on_message` only copies inbound frames into a bounded queue, and a full queue drops its oldest frame.
+
 - A worker thread processes the queue and sends results.
+
 - A `cancel` text message (barge-in) empties the queue. No output from before the cancel is sent after its acknowledgement.
 
 `tests/test_ws.py` checks ordering, drop accounting and barge-in under TSan.
@@ -149,13 +159,21 @@ Speech to speech runs as a pipeline of three blocking backend calls, in order on
 On the wire, audio is 24 kHz mono 16-bit PCM in base64. The module resamples to and from the backend rates with a windowed-sinc filter.
 
 Supported:
+
 - session updates;
+
 - `server_vad` turn detection, with an energy detector standing in for OpenAI's model-based VAD;
+
 - barge-in: speech during a response cancels it with `turn_detected`;
+
 - manual commit;
+
 - conversation item create, delete, retrieve and truncate;
+
 - text or audio output;
+
 - `response.cancel`;
+
 - input transcription events.
 
 Not supported yet: tools, G.711 formats, transcription-only sessions, out-of-band responses (`conversation: "none"`), and audio in `conversation.item.retrieved`. See [docs/dev/gaps.md](docs/dev/gaps.md).
@@ -184,10 +202,15 @@ TTS real-time factor (synthesis time / speech duration; below 1 is faster than r
 | OuteTTS-0.3-500M Q8_0 | 1.15-1.63 | 0.28-0.30 |
 
 - **Only the GPU is real-time.** Whisper transcribes the synthesized speech back verbatim in every case.
+
 - **ASR is fast even on CPU:** whisper `ggml-base.en` transcribes 11 s of speech in 0.4-0.5 s.
+
 - **Speaker profile:** `--tts-speaker-words 10` shortens it and helps on CPU (real-time factor 2.1-2.5 for the 1B model). Voice consistency with the shorter profile is not measured.
+
 - **Streaming:** audio streams while a sentence is generated. The vocoder runs over windows of 40 codes (16 for the first), with 64 codes of context and 16 of lookahead. On the RTX 4060, first audio arrives after 0.27-0.35 s instead of 1.3-2.4 s.
+
 - **Streamed audio differs** from whole-sentence vocoding of the same codes: waveform SNR 11-18 dB, spectral SNR 17-24 dB. WavTokenizer's attention spans the whole window. Intelligibility is unchanged (whisper round trips). Perceived quality has not been rated by listeners. `--tts-chunk -1` restores whole-sentence synthesis.
+
 - **Memory:** all three engines in one server use 3-4 GiB of GPU memory with the 1B models. Two such servers do not fit in 8 GiB. ggml aborts the process on a CUDA out-of-memory error.
 
 For a GPU build, point `LLAMA_DIR` and `WHISPER_DIR` at llama.cpp and whisper.cpp built with one shared ggml (same `GGML_MAX_NAME`). cyllama's build script does this when run from a spore checkout:
@@ -216,12 +239,19 @@ Engine adapters are separate CMake targets outside `libspore`. They are built on
 | `POST /v1/embeddings` (`float` and `base64`) | `embed` |
 
 A backend is a blocking function that pushes text through a callback. spore runs it on worker threads (`workers`, default 1) behind a bounded queue (`queue`, default 16; 503 when full). spore handles the protocol work:
+
 - request validation;
+
 - SSE framing;
+
 - `stop` sequences, including matches split across tokens;
+
 - holding back UTF-8 sequences split across tokens;
+
 - `max_tokens`;
+
 - usage reporting;
+
 - cancellation when the client disconnects.
 
 Sampling defaults follow llama-server: temperature 0.8, top_k 40, top_p 0.95, min_p 0.05.

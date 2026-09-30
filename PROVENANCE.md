@@ -4,6 +4,10 @@ spore is original work under the MIT licence (`LICENSE`).
 
 It was written as a clean-room replacement for a Mongoose-derived server (`nanosrv`, GPL-2.0-only). Mongoose and nanosrv source was not opened while spore was written. Development took place in a separate repository with no shared history.
 
+## Clean-room verification
+
+We ran [JPlag](https://github.com/jplag/JPlag) comparing spore and mongoose c code and obtained an average similarity of 0.82% and a maximum similarity of 3%.
+
 ## Sources used
 
 | Area | Source |

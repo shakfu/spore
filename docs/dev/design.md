@@ -9,7 +9,9 @@ Each entry states the choice, then why it was preferred over the alternative.
 ## Host and Origin checks are in the core, not middleware
 
 Loopback binding stops remote hosts. It does not stop a browser on the same host. Both attacks run through a hostile page:
+
 - **DNS rebinding.** The page reaches `127.0.0.1` under its own domain, so it sends a foreign `Host`.
+
 - **CSRF.** The page sends a cross-site `POST` with `Content-Type: text/plain`, which needs no preflight.
 
 Both checks run before routing. So no handler can forget them. The Host check is skipped for Unix sockets, because browsers cannot connect to them.
@@ -70,8 +72,11 @@ Turn detection uses 10 ms frame energy: `threshold` maps linearly onto -70..-20 
 whisper.cpp and llama.cpp each ship static ggml libraries. Linking both into one binary duplicates every symbol, so ggml comes from llama.cpp only, and `libwhisper.a` links against it.
 
 The installed whisper.cpp was built against ggml 0.23; llama.cpp's is 0.25. The mix was checked three ways:
+
 - The ggml headers differ only in additions and in the precision API. There the enum values that matter (0 and 10) and the deprecated setters are unchanged, and `libwhisper.a` references neither.
+
 - `struct ggml_tensor` is identical in both.
+
 - `make test-engines` transcribes whisper.cpp's `jfk.wav` verbatim.
 
 The alternative, rebuilding whisper.cpp from source against llama.cpp's ggml (`WHISPER_USE_SYSTEM_GGML`), removes the version skew. It is the fallback if a future ggml changes an interface whisper.cpp uses.
