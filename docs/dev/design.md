@@ -64,3 +64,60 @@ Both the loop thread (client events, VAD) and the worker send events and change 
 Speech is synthesized one sentence at a time, as the LLM streams text. Each sentence's transcript delta is sent just before its audio. So the transcript never runs ahead of what the client can play, and a cancelled item keeps only the words the client received.
 
 Turn detection uses 10 ms frame energy: `threshold` maps linearly onto -70..-20 dBFS, and two loud frames start speech. It is a stand-in for OpenAI's model-based VAD. The default silence is 500 ms, from the SDK docstring; the live reference shows 200 ms, which an energy detector would trip on every short pause. A model VAD (Silero, via whisper.cpp) can replace it without protocol changes.
+
+## Engine adapters share llama.cpp's ggml
+
+whisper.cpp and llama.cpp each ship static ggml libraries. Linking both into one binary duplicates every symbol, so ggml comes from llama.cpp only, and `libwhisper.a` links against it.
+
+The installed whisper.cpp was built against ggml 0.23; llama.cpp's is 0.25. The mix was checked three ways:
+- The ggml headers differ only in additions and in the precision API. There the enum values that matter (0 and 10) and the deprecated setters are unchanged, and `libwhisper.a` references neither.
+- `struct ggml_tensor` is identical in both.
+- `make test-engines` transcribes whisper.cpp's `jfk.wav` verbatim.
+
+The alternative, rebuilding whisper.cpp from source against llama.cpp's ggml (`WHISPER_USE_SYSTEM_GGML`), removes the version skew. It is the fallback if a future ggml changes an interface whisper.cpp uses.
+
+Both libraries were compiled with `-DGGML_MAX_NAME=160`, while the installed `ggml.h` defaults to 64. The adapters use only opaque pointers from `llama.h` and `whisper.h`, so the tensor layout never matters to them. Code that touches `struct ggml_tensor` directly must define the same value.
+
+## OuteTTS: where the time goes
+
+One 2.7 s sentence with the 1B model, profiled on a Ryzen 9 7940HX:
+
+| Stage | 8 threads | 16 threads |
+|---|---|---|
+| Prompt, 884 tokens | 2.62 s | 1.65 s |
+| Code generation, ~245 tokens | 5.9 s (42 tok/s) | 5.6 s (45 tok/s) |
+| Vocoder plus inverse DFT | 0.09 s | 0.09 s |
+
+The vocoder is negligible because the inverse DFT uses a precomputed twiddle table. The reference calls `cos` and `sin` in the inner loop, about 1.6M calls per 13 ms frame.
+
+The prompt is re-evaluated for every sentence. OuteTTS's format puts the user text between the speaker's words and the speaker's ~800 audio codes, so a prefix cache would cover only about 60 tokens. The speaker profile length is the lever instead. With 10 words the prompt drops to 332 tokens (0.6 s), and generation rises to 49 tok/s because attention runs over less context. Whisper round trips stay verbatim at 30, 10 and 5 words.
+
+The default thread count is the number of physical cores, 16 here. Generation is memory-bound, so it gains little; prompt evaluation is compute-bound and gains 1.6x.
+
+The reference zeroes the first 0.25 s of every utterance against start-up artifacts. That is not done here: spore synthesizes per sentence, and the round trips keep their first words without it.
+
+## GPU: one ggml, built by cyllama's script
+
+The CPU build could not run OuteTTS in real time. Generation needs about 90 tok/s, and the 1B model reached about 50 (see above). On an RTX 4060, the same code and models run at a real-time factor of 0.50-0.58 (1B) and 0.28-0.30 (500M). No adapter code changed; `--gpu` sets the layer offload and whisper's `use_gpu`.
+
+The GPU libraries come from cyllama's `manage.py`, run from a spore checkout: its paths follow the working directory, so cyllama's own build is untouched. It builds whisper.cpp and llama.cpp at the same pinned versions with one `GGML_MAX_NAME` (160). That removes the version skew noted above, and the struct-layout hazard with it. A hand-configured llama.cpp build was tried first; it needed `GGML_MAX_NAME` passed to the C, C++ and CUDA compilers separately, and its app targets failed to build. The script already encodes both.
+
+GPU memory decides how many engine servers can run. On 8 GiB, one server with the 1B LLM, whisper and 1B TTS fits; two do not. ggml aborts on CUDA out-of-memory, so the engine tests start one server at a time.
+
+## Streaming the vocoder
+
+WavTokenizer maps each code to one 320-sample frame. Its decoder is not causal: a frame's spectrum depends on the codes around it, over the whole window, through attention. Streaming therefore vocodes windows: `left` codes of context, the chunk, then `ahead` codes of lookahead. Only the chunk's samples are emitted, and one frame is crossfaded into the previous window's estimate.
+
+The parameters come from comparing streamed output with whole-sentence vocoding of identical codes (the sampling seed is fixed, so the codes match). Three sentences on an RTX 4060, with the 1B model:
+
+| left / ahead | Waveform SNR | Spectral SNR | First audio |
+|---|---|---|---|
+| 4 / 2 | 8.0-9.7 dB | 13-15 dB | 0.20-0.26 s |
+| 16 / 8 | 9.1-11.3 dB | 14-16 dB | 0.23-0.32 s |
+| 64 / 16 (chosen) | 10.9-18.3 dB | 17-24 dB | 0.27-0.35 s |
+| 1000 / 40 | 18.4-22.1 dB | 24-26 dB | - |
+| whole sentence | - | - | 1.27-2.41 s |
+
+The seam test put a one-frame window on each chunk boundary and compared error energy per sample there with the rest. For most sentences the ratio was at or below 1. A 4-frame crossfade changed nothing. So the difference is not a seam artifact. The decoder renders each window differently, because its attention sees different context. No finite window reproduces the whole-sentence rendering, and the whole-sentence rendering is itself one choice of context.
+
+Each lookahead code costs about 7 ms of first-audio latency on the GPU. Beyond 16, the SNR gain per code is small.

@@ -16,16 +16,18 @@ onoff   = $(if $(filter $(1),$(MODULES)),ON,OFF)
 CONFIG  = -DSPORE_WS=$(call onoff,ws) -DSPORE_LLM=$(call onoff,llm) \
           -DSPORE_REALTIME=$(call onoff,realtime) $(CMAKE_ARGS)
 
-# Optional llama.cpp backend (make llama / test-llama).
-LLAMA_DIR ?= ../cyllama/thirdparty/llama.cpp
-MODELS    ?= ../cyllama/models
+# Optional engine adapters (make engines / test-engines).
+LLAMA_DIR   ?= ../cyllama/thirdparty/llama.cpp
+WHISPER_DIR ?= ../cyllama/thirdparty/whisper.cpp
+MODELS      ?= $(HOME)/.models
+ASR_SAMPLE  ?= ../cyllama/build/whisper.cpp/samples/jfk.wav
 
 FUZZ_CC   ?= clang
 FUZZ_TIME ?= 60
 FUZZ      = build-fuzz
 
 .PHONY: all configure test unit replay integration asan tsan check-modules \
-        fuzz fuzz-run llama test-llama install clean
+        fuzz fuzz-run engines test-engines install clean
 
 all: configure
 	$(CMAKE) --build $(BUILD) -j$(JOBS)
@@ -34,7 +36,7 @@ configure:
 	@$(CMAKE) -S . -B $(BUILD) $(CONFIG) > /dev/null
 
 test: all
-	$(CTEST_PREFIX) $(CTEST) --test-dir $(BUILD) --output-on-failure -LE llama
+	$(CTEST_PREFIX) $(CTEST) --test-dir $(BUILD) --output-on-failure -LE engines
 
 unit: all
 	$(CTEST) --test-dir $(BUILD) --output-on-failure -R '^unit$$'
@@ -79,15 +81,17 @@ fuzz-run: fuzz
 			-artifact_prefix=$(FUZZ)/ $(FUZZ)/corpus-$$t tests/fuzz/seeds/$$t || exit 1; \
 	done
 
-# ---- llama.cpp backend -------------------------------------------------------
+# ---- engine adapters -------------------------------------------------------
+# spored-engines: llama.cpp (LLM) and whisper.cpp (ASR) behind the mock TTS.
 
-llama:
+engines:
 	@$(CMAKE) -S . -B $(BUILD) $(CONFIG) -DSPORE_LLAMA_DIR=$(abspath $(LLAMA_DIR)) \
-		-DSPORE_TEST_MODELS=$(abspath $(MODELS)) > /dev/null
+		-DSPORE_WHISPER_DIR=$(abspath $(WHISPER_DIR)) -DSPORE_TEST_MODELS=$(abspath $(MODELS)) \
+		-DSPORE_ASR_SAMPLE=$(abspath $(ASR_SAMPLE)) > /dev/null
 	$(CMAKE) --build $(BUILD) -j$(JOBS)
 
-test-llama: llama
-	$(CTEST) --test-dir $(BUILD) --output-on-failure -L llama
+test-engines: engines
+	$(CTEST) --test-dir $(BUILD) --output-on-failure -L engines
 
 # ---- install / clean -----------------------------------------------------------
 

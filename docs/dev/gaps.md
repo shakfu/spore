@@ -40,6 +40,12 @@ The code was drafted by an AI model that may have seen Mongoose in training (see
 - **One content part per item.** Multi-part user messages are joined into one text.
 - **Per-chunk resampling of synthesized audio.** Chunks are resampled independently, so a TTS rate other than 24 kHz gets small discontinuities at chunk edges. OuteTTS produces 24 kHz, so no resampling happens there.
 - **No rate limits.** `rate_limits.updated` is never sent. Clients treat it as optional.
+- **Batch transcription.** whisper runs once the turn is committed, so its time (about 4% of the audio length with `ggml-base.en` on CPU) adds directly to response latency. There are no transcription deltas while the user speaks.
+- **TTS is real-time only on a GPU.** On a Ryzen 9 7940HX, OuteTTS runs at real-time factor 1.15-1.63 (500M) and 2.6-3.1 (1B). On an RTX 4060 it runs at 0.28-0.58.
+- **Streamed TTS not rated by listeners.** Streamed audio differs from whole-sentence vocoding (spectral SNR 17-24 dB), with unchanged intelligibility. No listening test has been done. On CPU, generation is slower than playback, so streamed audio will stall between chunks.
+- **CUDA out-of-memory aborts the process.** ggml aborts rather than returning an error, so one engine server per GPU is the safe limit on 8 GiB.
+- **One voice, English only.** `voice` is ignored in favour of the built-in `en_male_1` profile. Text is reduced to ASCII words, so accented letters are dropped. Speaker-profile files are not loaded yet.
+- **ggml version skew.** whisper.cpp (ggml 0.23) links against llama.cpp's ggml 0.25. It is verified for the installed builds only; see `design.md`.
 
 ## LLM layer
 

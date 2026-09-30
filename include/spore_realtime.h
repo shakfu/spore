@@ -21,24 +21,36 @@ extern "C" {
 
 typedef struct spore_rt spore_rt;
 
-/* Receives synthesized audio: mono float in [-1, 1] at tts_rate. Returns 0
- * to continue, nonzero to stop (response cancelled). */
+/* Receives synthesized audio: mono float in [-1, 1] at tts.rate. Returns 0
+ * to continue, nonzero to stop (response cancelled). A call with n == 0
+ * sends nothing: slow engines use it to poll for cancellation. */
 typedef int (*spore_rt_emit_audio)(void *ctx, const float *pcm, size_t n);
 
-/* All calls block and run on a per-session worker thread. With more than
- * one session they can run concurrently. */
+/* Speech to text: append UTF-8 text to `out`. `pcm` is mono float at
+ * `rate`. Returns 0, or -1 on failure. */
 typedef struct {
-    /* Response text; the same interface spore_llm serves. */
-    spore_llm_backend llm;
-    /* Speech to text: append UTF-8 text to `out`. `pcm` is mono float at
-     * asr_rate. Returns 0, or -1 on failure. NULL: audio input is refused. */
-    int (*transcribe)(void *self, const float *pcm, size_t n, spore_buf *out);
-    int asr_rate;
-    /* Text to speech. Returns 0, or -1 on failure. NULL: only text output. */
-    int (*synthesize)(void *self, const char *text, size_t len,
-                      const char *voice, spore_rt_emit_audio emit, void *ctx);
-    int tts_rate;
-    void *self; /* passed to transcribe and synthesize */
+    int (*fn)(void *self, const float *pcm, size_t n, spore_buf *out);
+    void *self;
+    int rate;
+} spore_rt_asr;
+
+/* Text to speech: pass audio at `rate` to `emit` until done or `emit`
+ * returns nonzero. Returns 0, or -1 on failure. */
+typedef struct {
+    int (*fn)(void *self, const char *text, size_t len, const char *voice,
+              spore_rt_emit_audio emit, void *ctx);
+    void *self;
+    int rate;
+} spore_rt_tts;
+
+/* One engine per stage, each with its own context. All calls block and
+ * run on a per-session worker thread; with several sessions they can run
+ * concurrently. A NULL asr.fn refuses audio input; a NULL tts.fn allows
+ * only text output. */
+typedef struct {
+    spore_llm_backend llm; /* the same interface spore_llm serves */
+    spore_rt_asr asr;
+    spore_rt_tts tts;
 } spore_rt_backend;
 
 typedef struct {

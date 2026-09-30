@@ -15,8 +15,11 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 - [ ] Run `make fuzz-run` in CI with a time budget.
 - [ ] Run the Autobahn WebSocket testsuite against `/ws/echo`.
 
-- [ ] Realtime phase 2: whisper.cpp `transcribe` and `spore_llama` generation behind `spore_rt_backend`, with llama.cpp's ggml shared by both.
-- [ ] Realtime phase 3: port OuteTTS generation (cyllama's Python loop) to C++ as `synthesize`.
+- [x] Realtime phase 2: whisper.cpp `transcribe` and `spore_llama` generation behind `spore_rt_backend`, with llama.cpp's ggml shared by both.
+- [x] Realtime phase 3: port OuteTTS generation (cyllama's Python loop) to C++ as `synthesize`.
+- [x] Real-time TTS: measure OuteTTS-0.3-500M and GPU offload (RTX 4060: real-time factor 0.3-0.6).
+- [x] Stream the TTS vocoder in overlapping windows, to cut first-audio latency per sentence.
+- [ ] Listening test: streamed vs whole-sentence TTS (A/B WAVs from `docs/dev/design.md`'s measurement).
 - [ ] Fuzz target for realtime client events.
 
 ## Medium
@@ -30,6 +33,7 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md).
 
 ## Low
 
+- [ ] OuteTTS speaker-profile files, so `voice` can select among them.
 - [ ] Server-initiated WebSocket pings, to detect hung (not dead) local clients.
 - [ ] Stream static files instead of reading them whole; add `ETag` and `Range`.
 - [ ] Print embeddings at float32 precision (`%.9g`).

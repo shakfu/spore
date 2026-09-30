@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: MIT */
 #define _POSIX_C_SOURCE 200809L
 #include "spore.h"
-#ifdef SPORE_WITH_LLM
+#if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
 #include "echo_backend.h"
 #include "spore_llm.h"
 #endif
@@ -15,6 +15,12 @@
 #endif
 #ifdef SPORE_WITH_LLAMA
 #include "spore_llama.h"
+#endif
+#ifdef SPORE_WITH_WHISPER
+#include "spore_whisper.h"
+#endif
+#ifdef SPORE_WITH_OUTETTS
+#include "spore_outetts.h"
 #endif
 
 #include <errno.h>
@@ -332,11 +338,24 @@ static void usage(void) {
             "  --modules       print the compiled-in modules and exit\n"
             "  --idle-ms N     keep-alive idle timeout (default 30000)\n"
             "  --request-ms N  deadline to receive a request (default 30000)\n"
+#if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
+            "  --gpu           offload every engine to the GPU (needs a GPU ggml build)\n"
+#endif
 #ifdef SPORE_WITH_LLAMA
             "  --model PATH    GGUF model for the llama.cpp backend\n"
             "  --ctx N         context size (default 4096; the model's own with --embedding)\n"
             "  --gpu-layers N  layers to offload (default 0)\n"
             "  --embedding     serve /v1/embeddings instead of completions\n"
+#endif
+#ifdef SPORE_WITH_WHISPER
+            "  --asr PATH      whisper.cpp model for /v1/realtime speech input\n"
+            "  --asr-lang L    spoken language, or auto (default en)\n"
+#endif
+#ifdef SPORE_WITH_OUTETTS
+            "  --tts PATH      OuteTTS 0.2/0.3 model for /v1/realtime speech output\n"
+            "  --vocoder PATH  WavTokenizer model for --tts\n"
+            "  --tts-speaker-words N  shorter speaker profile, faster (default 30)\n"
+            "  --tts-chunk N   stream N codes per chunk (default 40); -1: whole sentences\n"
 #endif
 #ifdef SPORE_WITH_LLM
             "Without --model the echo test backend answers.\n"
@@ -354,6 +373,15 @@ int main(int argc, char **argv) {
     size_t n_origins = 0;
 #ifdef SPORE_WITH_LLAMA
     spore_llama_config mcfg = {.n_ctx = -1};
+#endif
+#if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
+    int gpu = 0;
+#endif
+#ifdef SPORE_WITH_WHISPER
+    spore_whisper_config wcfg = {0};
+#endif
+#ifdef SPORE_WITH_OUTETTS
+    spore_outetts_config tcfg = {0};
 #endif
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -375,11 +403,24 @@ int main(int argc, char **argv) {
         }
         else if (ARG("--idle-ms")) cfg.idle_ms = atoi(v);
         else if (ARG("--request-ms")) cfg.request_ms = atoi(v);
+#if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
+        else if (strcmp(a, "--gpu") == 0) gpu = 1;
+#endif
 #ifdef SPORE_WITH_LLAMA
         else if (ARG("--model")) mcfg.model_path = v;
         else if (ARG("--ctx")) mcfg.n_ctx = atoi(v);
         else if (ARG("--gpu-layers")) mcfg.n_gpu_layers = atoi(v);
         else if (strcmp(a, "--embedding") == 0) mcfg.embedding = 1;
+#endif
+#ifdef SPORE_WITH_WHISPER
+        else if (ARG("--asr")) wcfg.model_path = v;
+        else if (ARG("--asr-lang")) wcfg.language = v;
+#endif
+#ifdef SPORE_WITH_OUTETTS
+        else if (ARG("--tts")) tcfg.model_path = v;
+        else if (ARG("--vocoder")) tcfg.vocoder_path = v;
+        else if (ARG("--tts-speaker-words")) tcfg.speaker_words = atoi(v);
+        else if (ARG("--tts-chunk")) tcfg.chunk_codes = atoi(v);
 #endif
         else usage();
 #undef ARG
@@ -387,9 +428,16 @@ int main(int argc, char **argv) {
     cfg.origins = origins;
 #ifdef SPORE_WITH_LLAMA
     if (mcfg.n_ctx < 0) mcfg.n_ctx = mcfg.embedding ? 0 : 4096;
+    if (gpu && !mcfg.n_gpu_layers) mcfg.n_gpu_layers = 999; /* all layers */
+#endif
+#ifdef SPORE_WITH_WHISPER
+    wcfg.use_gpu = gpu;
+#endif
+#ifdef SPORE_WITH_OUTETTS
+    if (gpu) tcfg.n_gpu_layers = 999;
 #endif
 
-#ifdef SPORE_WITH_LLM
+#if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
     spore_llm_backend be = echo_backend();
 #endif
 #ifdef SPORE_WITH_LLAMA
@@ -400,6 +448,21 @@ int main(int argc, char **argv) {
             return 1;
         }
         be = *lb;
+    }
+#endif
+#ifdef SPORE_WITH_WHISPER
+    spore_whisper *asr = NULL;
+    if (wcfg.model_path && !(asr = spore_whisper_new(&wcfg))) {
+        fprintf(stderr, "spored: cannot load %s\n", wcfg.model_path);
+        return 1;
+    }
+#endif
+#ifdef SPORE_WITH_OUTETTS
+    spore_outetts *tts = NULL;
+    if (tcfg.model_path && (!tcfg.vocoder_path || !(tts = spore_outetts_new(&tcfg)))) {
+        fprintf(stderr, "spored: cannot load %s with vocoder %s\n", tcfg.model_path,
+                tcfg.vocoder_path ? tcfg.vocoder_path : "(none; use --vocoder)");
+        return 1;
     }
 #endif
 
@@ -420,9 +483,20 @@ int main(int argc, char **argv) {
            spore_route(g_srv, "GET", "/ws/duplex", on_ws_duplex, NULL);
 #endif
 #ifdef SPORE_WITH_REALTIME
+    /* Mock stages, replaced by whichever engines were loaded. */
     spore_rt_backend rtb = rt_mock_backend();
-    spore_rt *rt = spore_rt_new(g_srv, &rtb, NULL);
-    err |= !rt;
+    rtb.llm = be;
+#ifdef SPORE_WITH_WHISPER
+    if (asr)
+        rtb.asr = (spore_rt_asr){spore_whisper_transcribe, asr, SPORE_WHISPER_RATE};
+#endif
+#ifdef SPORE_WITH_OUTETTS
+    if (tts)
+        rtb.tts = (spore_rt_tts){spore_outetts_synthesize, tts, SPORE_OUTETTS_RATE};
+#endif
+    /* An embedding-only model cannot answer; serve no realtime then. */
+    spore_rt *rt = rtb.llm.generate ? spore_rt_new(g_srv, &rtb, NULL) : NULL;
+    err |= rtb.llm.generate && !rt;
 #endif
     err |= spore_route(g_srv, "POST", "/echo", on_echo, NULL) ||
            (static_dir &&
@@ -452,6 +526,12 @@ int main(int argc, char **argv) {
 #endif
 #ifdef SPORE_WITH_LLAMA
     spore_llama_free(lb);
+#endif
+#ifdef SPORE_WITH_WHISPER
+    spore_whisper_free(asr);
+#endif
+#ifdef SPORE_WITH_OUTETTS
+    spore_outetts_free(tts);
 #endif
     return rc ? 1 : 0;
 }

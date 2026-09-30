@@ -45,7 +45,9 @@ typedef struct {
 #define SPORE_LLM_SEED_RANDOM 0xFFFFFFFFu
 
 /* Receives generated text in arbitrary byte fragments. Returns 0 to
- * continue, nonzero to stop: the client left or a stop sequence matched. */
+ * continue, nonzero to stop: the client left or a stop sequence matched.
+ * A call with len == 0 emits nothing: backends use it to poll for a stop
+ * during long work such as prompt evaluation. */
 typedef int (*spore_llm_emit)(void *ctx, const char *text, size_t len);
 
 typedef struct {

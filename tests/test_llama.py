@@ -1,6 +1,6 @@
-"""llama.cpp backend, end to end. Opt-in: `make test-llama`.
+"""llama.cpp backend, end to end. Opt-in: `make test-engines`.
 
-Needs SPORED_LLAMA (the binary), SPORE_CHAT_MODEL and SPORE_EMBED_MODEL
+Needs SPORED_ENGINES (the binary), SPORE_CHAT_MODEL and SPORE_EMBED_MODEL
 (GGUF paths); skipped otherwise.
 """
 
@@ -10,11 +10,11 @@ import subprocess
 
 import pytest
 
-BIN = os.environ.get("SPORED_LLAMA")
+BIN = os.environ.get("SPORED_ENGINES")
 CHAT = os.environ.get("SPORE_CHAT_MODEL")
 EMBED = os.environ.get("SPORE_EMBED_MODEL")
 
-pytestmark = pytest.mark.skipif(not BIN, reason="SPORED_LLAMA not set")
+pytestmark = pytest.mark.skipif(not BIN, reason="SPORED_ENGINES not set")
 
 
 def start(*args):

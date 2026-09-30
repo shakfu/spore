@@ -566,7 +566,7 @@ static void on_session_update(ctx *c, const spore_jnode *ev) {
     const spore_jnode *mod = get(c, o, "output_modalities");
     int audio = mod ? parse_modalities(c, mod) : s->cfg.audio;
     if (audio < 0) ERR("invalid_value", "output_modalities must be [\"audio\"] or [\"text\"]", "session.output_modalities");
-    if (audio && !s->rt->be.synthesize) ERR("unsupported", "this server has no speech synthesis", "session.output_modalities");
+    if (audio && !s->rt->be.tts.fn) ERR("unsupported", "this server has no speech synthesis", "session.output_modalities");
     const spore_jnode *mt = get(c, o, "max_output_tokens");
     long max_tokens = mt ? parse_max_tokens(mt) : s->cfg.max_tokens;
     if (max_tokens == -2) ERR("invalid_value", "max_output_tokens must be 1..4096 or \"inf\"", "session.max_output_tokens");
@@ -880,7 +880,7 @@ static void on_response_create(ctx *c, const spore_jnode *ev) {
         if ((n = get(c, o, "tools")) && n->type == SPORE_JARR && n->len)
             ERR("unsupported", "tools are not supported", "response.tools");
     }
-    if (audio && !s->rt->be.synthesize)
+    if (audio && !s->rt->be.tts.fn)
         ERR("unsupported", "this server has no speech synthesis", "response.output_modalities");
     if (start_response(s, audio, instructions, max_tokens))
         ERR("conversation_already_has_active_response",
@@ -932,15 +932,15 @@ static void run_transcribe(session *s, job *j) {
     const spore_rt_backend *be = &s->rt->be;
     spore_buf text = {0};
     int ok = 0;
-    if (be->transcribe) {
+    if (be->asr.fn) {
         float *f = malloc((j->n ? j->n : 1) * sizeof *f);
         size_t m = 0;
         float *r = NULL;
         if (f) {
             spore__pcm16_to_float(j->pcm, j->n, f);
-            r = spore__resample(f, j->n, RATE, be->asr_rate, &m);
+            r = spore__resample(f, j->n, RATE, be->asr.rate, &m);
         }
-        ok = r && !be->transcribe(be->self, r, m, &text) && !text.err;
+        ok = r && !be->asr.fn(be->asr.self, r, m, &text) && !text.err;
         free(f);
         free(r);
     }
@@ -1007,10 +1007,10 @@ static void part_event(gen *g, const char *type, const char *field,
 
 static int emit_audio(void *vg, const float *pcm, size_t n) {
     gen *g = vg;
-    if (stopped(g)) return 1;
+    if (stopped(g) || !n) return stopped(g); /* n == 0: cancellation poll */
     const spore_rt_backend *be = &g->s->rt->be;
     size_t m = 0;
-    float *r = spore__resample(pcm, n, be->tts_rate, RATE, &m);
+    float *r = spore__resample(pcm, n, be->tts.rate, RATE, &m);
     unsigned char *raw = r ? malloc(m * 2 + 1) : NULL;
     spore_buf b64 = {0};
     if (raw) {
@@ -1048,7 +1048,7 @@ static void speak(gen *g, size_t from, size_t to) {
     }
     pthread_mutex_unlock(&g->s->mu);
     const spore_rt_backend *be = &g->s->rt->be;
-    if (be->synthesize(be->self, t, n, g->voice, emit_audio, g) && !stopped(g))
+    if (be->tts.fn(be->tts.self, t, n, g->voice, emit_audio, g) && !stopped(g))
         g->failed = 1;
 }
 
@@ -1401,7 +1401,7 @@ static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
     config *c = &s->cfg;
     c->instructions = dup0(rt->instructions);
     c->voice = dup0(rt->voice);
-    c->audio = rt->be.synthesize != NULL;
+    c->audio = rt->be.tts.fn != NULL;
     c->speed = 1;
     c->td = TD_SERVER;
     c->threshold = 0.5;
@@ -1439,8 +1439,8 @@ static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
 
 spore_rt *spore_rt_new(spore_server *srv, const spore_rt_backend *be,
                        const spore_rt_config *cfg) {
-    if (!be->llm.generate || (be->transcribe && be->asr_rate <= 0) ||
-        (be->synthesize && be->tts_rate <= 0))
+    if (!be->llm.generate || (be->asr.fn && be->asr.rate <= 0) ||
+        (be->tts.fn && be->tts.rate <= 0))
         return NULL;
     spore_rt *rt = calloc(1, sizeof *rt);
     if (!rt) return NULL;

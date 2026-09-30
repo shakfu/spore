@@ -8,6 +8,7 @@
 
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -114,8 +115,11 @@ spore_llm_finish run(backend *b, const spore_llm_params *p, spore_llm_emit emit,
     b->cached.resize(keep);
     usage->cached_tokens = (int)keep;
 
-    const int n_batch = (int)llama_n_batch(b->ctx);
+    // Batches of at most 256, polling between them (emit with no text), so
+    // a cancel or barge-in need not wait for a long uncached prompt.
+    const int n_batch = std::min<int>((int)llama_n_batch(b->ctx), 256);
     for (int i = (int)keep; i < n_prompt; i += n_batch) {
+        if (i > (int)keep && emit(ectx, "", 0)) return SPORE_LLM_STOP;
         int n = n_prompt - i < n_batch ? n_prompt - i : n_batch;
         if (llama_decode(b->ctx, llama_batch_get_one(toks.data() + i, n)))
             return fail(b);

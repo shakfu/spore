@@ -18,6 +18,8 @@ It was written as a clean-room replacement for a Mongoose-derived server (`nanos
 | OpenAI Realtime API (GA) | `openai` Python SDK 3.21.0 type definitions (`openai/types/realtime/`, Apache-2.0), [Realtime WebSocket guide](https://developers.openai.com/api/docs/guides/realtime-websocket), [server events reference](https://developers.openai.com/api/reference/resources/realtime/server-events); wire shapes only, no code |
 | llama-server defaults | [llama.cpp server README](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) (MIT) |
 | llama.cpp backend | `llama.h` public API (MIT) |
+| whisper.cpp backend | `whisper.h` public API (MIT) |
+| OuteTTS backend | Ported from cyllama's TTS (MIT, same author), derived from llama.cpp's OuteTTS example (MIT). The default speaker profile (codes for OuteTTS's `en_male_1`) comes from those sources. Model weights are not distributed and carry their own licenses |
 | WebSocket | [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455) |
 | SHA-1 | [FIPS 180-4 section 6.1](https://csrc.nist.gov/pubs/fips/180-4/upd1/final) |
 | POSIX interfaces | POSIX.1-2008 |

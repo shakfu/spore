@@ -34,7 +34,9 @@ class RT:
     """Minimal event-level client."""
 
     def __init__(self, srv, query="?model=spore-test", **kw):
-        self.ws = wsclient.connect(f"ws://127.0.0.1:{srv.port}/v1/realtime{query}", max_size=None, **kw)
+        # Enter the connection as `with` would; newer websockets require it.
+        self.conn = wsclient.connect(f"ws://127.0.0.1:{srv.port}/v1/realtime{query}", max_size=None, **kw)
+        self.ws = self.conn.__enter__()
         self.log = []
 
     def send(self, **ev):
@@ -64,7 +66,7 @@ class RT:
         self.send(type="conversation.item.create", item={"type": "message", "role": role, "content": [{"type": part, "text": text}]})
 
     def close(self):
-        self.ws.close()
+        self.conn.__exit__(None, None, None)
 
 
 @pytest.fixture

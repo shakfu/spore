@@ -15,8 +15,12 @@ set(SPORE_SANITIZE "" CACHE STRING
     "Sanitizers for every target: address,undefined or thread")
 set(SPORE_LLAMA_DIR "" CACHE PATH
     "llama.cpp tree with include/ and lib/ for the llama backend; empty disables it")
+set(SPORE_WHISPER_DIR "" CACHE PATH
+    "whisper.cpp tree with include/ and lib/ for the whisper backend; empty disables it")
 set(SPORE_TEST_MODELS "" CACHE PATH
-    "Directory of GGUF models for the llama integration test")
+    "Directory of models for the engine tests (make test-engines)")
+set(SPORE_ASR_SAMPLE "" CACHE FILEPATH
+    "16 kHz mono WAV of known speech for the ASR test (whisper.cpp's samples/jfk.wav)")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
@@ -110,34 +114,100 @@ if(SPORE_BUILD_EXAMPLES)
   target_include_directories(spored PRIVATE examples)
   target_link_libraries(spored PRIVATE spore)
 
-  if(SPORE_LLAMA_DIR)
-    if(NOT SPORE_LLM)
-      message(FATAL_ERROR "SPORE_LLAMA_DIR needs SPORE_LLM=ON")
-    endif()
+  # ---- engine adapters (backends/) -------------------------------------
+  # Each adapter links one engine; spored-engines combines those configured.
+  # ggml is linked once: llama.cpp's copy when present, else whisper.cpp's.
+  # whisper.cpp built against ggml 0.23 links against llama.cpp's 0.25:
+  # the ggml_tensor layout and the precision API it uses are unchanged.
+  set(engine_defs)
+  set(engine_libs)
+  if(SPORE_LLAMA_DIR OR SPORE_WHISPER_DIR)
     enable_language(CXX)
     find_package(OpenMP REQUIRED COMPONENTS CXX)
-    set(llama_libs)
-    foreach(lib llama ggml ggml-cpu ggml-base)
-      set(path ${SPORE_LLAMA_DIR}/lib/lib${lib}.a)
+    if(SPORE_LLAMA_DIR)
+      set(ggml_dir ${SPORE_LLAMA_DIR})
+    else()
+      set(ggml_dir ${SPORE_WHISPER_DIR})
+    endif()
+    function(spore_require_lib path)
       if(NOT EXISTS ${path})
         message(FATAL_ERROR "missing ${path}")
       endif()
-      list(APPEND llama_libs ${path})
+    endfunction()
+    add_library(spore_ggml INTERFACE)
+    foreach(lib ggml ggml-cpu ggml-base)
+      spore_require_lib(${ggml_dir}/lib/lib${lib}.a)
+      target_link_libraries(spore_ggml INTERFACE ${ggml_dir}/lib/lib${lib}.a)
     endforeach()
+    # GPU backends, when the ggml build has them (same detection as chimera).
+    if(EXISTS ${ggml_dir}/lib/libggml-cuda.a)
+      find_package(CUDAToolkit REQUIRED)
+      target_link_libraries(spore_ggml INTERFACE ${ggml_dir}/lib/libggml-cuda.a
+        CUDA::cudart CUDA::cublas CUDA::cuda_driver)
+      message(STATUS "spore engines: CUDA backend")
+      set(SPORE_ENGINE_GPU 1)
+    endif()
+    if(EXISTS ${ggml_dir}/lib/libggml-vulkan.a)
+      find_package(Vulkan REQUIRED)
+      target_link_libraries(spore_ggml INTERFACE ${ggml_dir}/lib/libggml-vulkan.a Vulkan::Vulkan)
+      message(STATUS "spore engines: Vulkan backend")
+      set(SPORE_ENGINE_GPU 1)
+    endif()
+    target_link_libraries(spore_ggml INTERFACE OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+  endif()
+
+  if(SPORE_LLAMA_DIR)
+    if(NOT SPORE_LLM AND NOT SPORE_REALTIME)
+      message(FATAL_ERROR "SPORE_LLAMA_DIR needs SPORE_LLM or SPORE_REALTIME")
+    endif()
+    spore_require_lib(${SPORE_LLAMA_DIR}/lib/libllama.a)
     add_library(spore_llama STATIC backends/llama/spore_llama.cpp)
     set_target_properties(spore_llama PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
     target_compile_options(spore_llama PRIVATE -Wall -Wextra)
     target_include_directories(spore_llama
       PUBLIC backends/llama PRIVATE ${SPORE_LLAMA_DIR}/include)
-    target_link_libraries(spore_llama PUBLIC spore ${llama_libs}
-      OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
+    target_link_libraries(spore_llama PUBLIC spore
+      ${SPORE_LLAMA_DIR}/lib/libllama.a spore_ggml)
+    list(APPEND engine_defs SPORE_WITH_LLAMA)
+    list(APPEND engine_libs spore_llama)
+  endif()
 
-    add_executable(spored-llama ${SPORED_SRC})
-    spore_c_target(spored-llama)
-    target_compile_definitions(spored-llama PRIVATE SPORE_WITH_LLAMA)
-    target_include_directories(spored-llama PRIVATE examples)
-    target_link_libraries(spored-llama PRIVATE spore_llama)
-    set_target_properties(spored-llama PROPERTIES LINKER_LANGUAGE CXX)
+  # OuteTTS runs on llama.cpp too, so it comes with SPORE_LLAMA_DIR.
+  if(SPORE_LLAMA_DIR AND SPORE_REALTIME)
+    add_library(spore_outetts STATIC backends/outetts/spore_outetts.cpp)
+    set_target_properties(spore_outetts PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_compile_options(spore_outetts PRIVATE -Wall -Wextra)
+    target_include_directories(spore_outetts
+      PUBLIC backends/outetts PRIVATE ${SPORE_LLAMA_DIR}/include)
+    target_link_libraries(spore_outetts PUBLIC spore
+      ${SPORE_LLAMA_DIR}/lib/libllama.a spore_ggml Threads::Threads)
+    list(APPEND engine_defs SPORE_WITH_OUTETTS)
+    list(APPEND engine_libs spore_outetts)
+  endif()
+
+  if(SPORE_WHISPER_DIR)
+    if(NOT SPORE_REALTIME)
+      message(FATAL_ERROR "SPORE_WHISPER_DIR needs SPORE_REALTIME")
+    endif()
+    spore_require_lib(${SPORE_WHISPER_DIR}/lib/libwhisper.a)
+    add_library(spore_whisper STATIC backends/whisper/spore_whisper.c)
+    spore_c_target(spore_whisper)
+    # whisper.cpp's headers are not our code: include them as system headers.
+    target_include_directories(spore_whisper PUBLIC backends/whisper)
+    target_include_directories(spore_whisper SYSTEM PRIVATE ${SPORE_WHISPER_DIR}/include)
+    target_link_libraries(spore_whisper PUBLIC spore
+      ${SPORE_WHISPER_DIR}/lib/libwhisper.a spore_ggml)
+    list(APPEND engine_defs SPORE_WITH_WHISPER)
+    list(APPEND engine_libs spore_whisper)
+  endif()
+
+  if(engine_libs)
+    add_executable(spored-engines ${SPORED_SRC})
+    spore_c_target(spored-engines)
+    target_compile_definitions(spored-engines PRIVATE ${engine_defs})
+    target_include_directories(spored-engines PRIVATE examples)
+    target_link_libraries(spored-engines PRIVATE ${engine_libs})
+    set_target_properties(spored-engines PROPERTIES LINKER_LANGUAGE CXX)
   endif()
 endif()
 
@@ -176,13 +246,16 @@ if(SPORE_BUILD_TESTS)
     set_tests_properties(integration PROPERTIES
       ENVIRONMENT "SPORED=$<TARGET_FILE:spored>")
 
-    if(TARGET spored-llama AND SPORE_TEST_MODELS)
-      add_test(NAME llama
-        COMMAND ${UV} run --no-project --with pytest --with openai
-                pytest -q -p no:cacheprovider ${PROJECT_SOURCE_DIR}/tests/test_llama.py
+    # Real engines and models: excluded from `make test`, run by `make test-engines`.
+    if(TARGET spored-engines AND SPORE_TEST_MODELS)
+      set(m ${SPORE_TEST_MODELS})
+      add_test(NAME engines
+        COMMAND ${UV} run --no-project --with pytest --with "openai[realtime]" --with websockets
+                pytest -q -p no:cacheprovider
+                ${PROJECT_SOURCE_DIR}/tests/test_llama.py ${PROJECT_SOURCE_DIR}/tests/test_engines.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/tests)
-      set_tests_properties(llama PROPERTIES LABELS llama ENVIRONMENT
-        "SPORED=$<TARGET_FILE:spored>;SPORED_LLAMA=$<TARGET_FILE:spored-llama>;SPORE_CHAT_MODEL=${SPORE_TEST_MODELS}/Qwen3-0.6B-Q8_0.gguf;SPORE_EMBED_MODEL=${SPORE_TEST_MODELS}/bge-small-en-v1.5-q8_0.gguf")
+      set_tests_properties(engines PROPERTIES LABELS engines ENVIRONMENT
+        "SPORED=$<TARGET_FILE:spored>;SPORED_ENGINES=$<TARGET_FILE:spored-engines>;SPORE_CHAT_MODEL=${m}/Qwen3-0.6B-Q8_0.gguf;SPORE_EMBED_MODEL=${m}/bge-small-en-v1.5-q8_0.gguf;SPORE_VOICE_LLM=${m}/Llama-3.2-1B-Instruct-Q8_0.gguf;SPORE_ASR_MODEL=${m}/ggml-base.en.bin;SPORE_ASR_SAMPLE=${SPORE_ASR_SAMPLE};SPORE_TTS_MODEL=${m}/OuteTTS-0.3-1B-Q6_K.gguf;SPORE_VOCODER=${m}/WavTokenizer-Large-75-F16.gguf;SPORE_ENGINE_GPU=${SPORE_ENGINE_GPU}")
     endif()
   elseif(SPORE_BUILD_EXAMPLES)
     message(STATUS "uv not found: integration tests disabled")

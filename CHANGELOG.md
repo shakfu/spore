@@ -21,6 +21,22 @@ Initial release.
 - Browser authentication: with `spore_config.token` set, the token is also accepted as the WebSocket subprotocol `openai-insecure-api-key.<token>`, OpenAI's browser convention.
 - `spore_ws_config.on_message` now receives `char *data`, which may be modified in place, for example by `spore_json_parse`. This avoids a copy of large messages such as 15 MiB audio appends.
 
+- `backends/whisper`: whisper.cpp speech-to-text for `spore_realtime`. whisper.cpp and llama.cpp share llama.cpp's ggml in one binary. `spored-engines` (`make engines`) replaces `spored-llama` and combines whichever engines are configured. `make test-engines` checks a verbatim transcript of a known recording and a spoken turn answered by Llama-3.2-1B.
+- `spore_rt_backend` now has one sub-struct per stage (`asr`, `tts`), each with its own function, context and rate, so independent engine adapters can be combined. Phase 1 had a single shared `self`.
+
+- `backends/outetts`: OuteTTS 0.2/0.3 text-to-speech on llama.cpp, with the WavTokenizer vocoder, for `spore_realtime`. It is ported from cyllama's generation loop, and so from llama.cpp's OuteTTS example. Changes from those:
+  - text normalization without `std::regex`;
+  - an inverse DFT with a precomputed twiddle table (the vocoder takes about 0.1 s per sentence);
+  - cancellation polled during code generation (`emit(ctx, NULL, 0)`);
+  - a configurable speaker-profile length.
+
+  `make test-engines` transcribes the synthesized speech back with whisper and checks the words. On a Ryzen 9 7940HX the 1B model runs 2-3x slower than real time.
+
+- GPU engines. CMake links `libggml-cuda.a` or `libggml-vulkan.a` when `LLAMA_DIR` has them, and `spored-engines --gpu` offloads the LLM, whisper and OuteTTS. On an RTX 4060, OuteTTS runs 2-3.5x faster than real time (CPU: 1.2-3x slower). The README documents building the GPU libraries with cyllama's `manage.py`.
+
+- OuteTTS streams: the vocoder runs over overlapping windows as codes arrive (`chunk_codes`, `--tts-chunk`; `-1` is whole sentences). First audio drops from 1.3-2.4 s to 0.27-0.35 s on an RTX 4060. The streamed audio is not bit-identical to whole-sentence vocoding (see `docs/dev/design.md`).
+- Prompt evaluation in `spore_llama` and `spore_outetts` runs in batches and polls for cancellation between them. An emit with no data now polls in both backend interfaces. A cancel during an OuteTTS prompt waited 0.64 s on CPU and now takes 0.25 s. This was found through an intermittent test failure.
+
 ### Fixed before release
 
 - Lost wake-up in the event loop. The loop cleared `wake_pending` before draining the wake pipe. A worker byte written between the two was drained, but the flag stayed set, so no later worker wrote again. Every cross-thread reply then waited for the 1 s poll cap. `test_no_lost_wakeups_under_streaming` measures the stall.

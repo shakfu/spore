@@ -44,8 +44,8 @@ make test                 # ctest: unit tests, fuzz seed replay, pytest integrat
 make asan tsan            # the same suites under sanitizers
 make check-modules        # build and test every module set
 make fuzz-run             # libFuzzer on the HTTP, JSON and WebSocket parsers (clang), FUZZ_TIME=60
-make llama                # build/spored-llama, LLAMA_DIR=path/to/llama.cpp
-make test-llama           # end-to-end with real GGUF models, MODELS=dir
+make engines              # build/spored-engines with llama.cpp and whisper.cpp (LLAMA_DIR, WHISPER_DIR)
+make test-engines         # end-to-end with real models (MODELS=dir, ASR_SAMPLE=wav)
 make install PREFIX=...   # headers, libspore.a, CMake package
 ```
 
@@ -160,7 +160,50 @@ Supported:
 
 Not supported yet: tools, G.711 formats, transcription-only sessions, out-of-band responses (`conversation: "none"`), and audio in `conversation.item.retrieved`. See [docs/dev/gaps.md](docs/dev/gaps.md).
 
-`spored` serves the mock backend in `examples/rt_mock_backend.c`: its transcripts report the audio length, it echoes the text, and it speaks a tone. Real engines come next.
+`spored` serves the mock backend in `examples/rt_mock_backend.c`: its transcripts report the audio length, it echoes the text, and it speaks a tone.
+
+`spored-engines` replaces the mock stages with the engines it was given:
+
+```sh
+make engines
+build/spored-engines --model Llama-3.2-1B-Instruct-Q8_0.gguf --asr ggml-base.en.bin \
+    --tts OuteTTS-0.3-1B-Q6_K.gguf --vocoder WavTokenizer-Large-75-F16.gguf
+```
+
+| Stage | Engine | Adapter |
+|---|---|---|
+| ASR | whisper.cpp | `backends/whisper/` (C) |
+| LLM | llama.cpp | `backends/llama/` (C++) |
+| TTS | OuteTTS 0.2/0.3 + WavTokenizer on llama.cpp | `backends/outetts/` (C++) |
+
+TTS real-time factor (synthesis time / speech duration; below 1 is faster than real time), with the full speaker profile. Measured on a Ryzen 9 7940HX with an RTX 4060 (8 GiB):
+
+| TTS model | CPU, 16 threads | GPU (`--gpu`) |
+|---|---|---|
+| OuteTTS-0.3-1B Q6_K | 2.6-3.1 | 0.50-0.58 |
+| OuteTTS-0.3-500M Q8_0 | 1.15-1.63 | 0.28-0.30 |
+
+- **Only the GPU is real-time.** Whisper transcribes the synthesized speech back verbatim in every case.
+- **ASR is fast even on CPU:** whisper `ggml-base.en` transcribes 11 s of speech in 0.4-0.5 s.
+- **Speaker profile:** `--tts-speaker-words 10` shortens it and helps on CPU (real-time factor 2.1-2.5 for the 1B model). Voice consistency with the shorter profile is not measured.
+- **Streaming:** audio streams while a sentence is generated. The vocoder runs over windows of 40 codes (16 for the first), with 64 codes of context and 16 of lookahead. On the RTX 4060, first audio arrives after 0.27-0.35 s instead of 1.3-2.4 s.
+- **Streamed audio differs** from whole-sentence vocoding of the same codes: waveform SNR 11-18 dB, spectral SNR 17-24 dB. WavTokenizer's attention spans the whole window. Intelligibility is unchanged (whisper round trips). Perceived quality has not been rated by listeners. `--tts-chunk -1` restores whole-sentence synthesis.
+- **Memory:** all three engines in one server use 3-4 GiB of GPU memory with the 1B models. Two such servers do not fit in 8 GiB. ggml aborts the process on a CUDA out-of-memory error.
+
+For a GPU build, point `LLAMA_DIR` and `WHISPER_DIR` at llama.cpp and whisper.cpp built with one shared ggml (same `GGML_MAX_NAME`). cyllama's build script does this when run from a spore checkout:
+
+```sh
+mkdir -p deps && cd deps
+GGML_CUDA=1 CMAKE_CUDA_ARCHITECTURES=89 python3 ~/projects/cyllama/scripts/manage.py build -l -w -D --cuda
+cd .. && make engines BUILD=build-gpu LLAMA_DIR=deps/thirdparty/llama.cpp WHISPER_DIR=deps/thirdparty/whisper.cpp
+build-gpu/spored-engines --gpu --model ... --asr ... --tts ... --vocoder ...
+```
+
+CMake links `libggml-cuda.a` (or `libggml-vulkan.a`) when it is present in `LLAMA_DIR`.
+
+Model weights carry their own licenses, separate from spore's MIT code. Check the OuteTTS model cards: the 0.3 models are reported as CC BY-NC-SA 4.0 (1B) and CC BY-SA 4.0 (500M).
+
+Engine adapters are separate CMake targets outside `libspore`. They are built only when `SPORE_LLAMA_DIR` or `SPORE_WHISPER_DIR` is set, and ggml is linked once, from llama.cpp.
 
 ## LLM endpoints
 
@@ -186,9 +229,9 @@ Sampling defaults follow llama-server: temperature 0.8, top_k 40, top_p 0.95, mi
 `backends/llama/` wraps llama.cpp in 230 lines of C++:
 
 ```sh
-make llama
-build/spored-llama --model Qwen3-0.6B-Q8_0.gguf --port 8080
-build/spored-llama --model bge-small-en-v1.5-q8_0.gguf --embedding --port 8081
+make engines
+build/spored-engines --model Qwen3-0.6B-Q8_0.gguf --port 8080
+build/spored-engines --model bge-small-en-v1.5-q8_0.gguf --embedding --port 8081
 ```
 
 The official `openai` Python SDK passes against both (`tests/test_llm.py`, `tests/test_llama.py`).

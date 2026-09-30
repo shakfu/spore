@@ -51,8 +51,6 @@ static int synthesize(void *self, const char *text, size_t len,
 
 spore_rt_backend rt_mock_backend(void) {
     return (spore_rt_backend){.llm = echo_backend(),
-                              .transcribe = transcribe,
-                              .asr_rate = ASR_RATE,
-                              .synthesize = synthesize,
-                              .tts_rate = TTS_RATE};
+                              .asr = {transcribe, NULL, ASR_RATE},
+                              .tts = {synthesize, NULL, TTS_RATE}};
 }
