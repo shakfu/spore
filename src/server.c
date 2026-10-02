@@ -744,10 +744,11 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
             }
             c->head_len = h;
             c->need = (size_t)h + clen;
+            /* Before grow_in(): its realloc leaves `req` pointing at freed memory. */
+            int expect = spore__ieq(spore_header_get(req, "Expect"), "100-continue");
             c->base = c->in;
             if (grow_in(c, c->need + 1)) return -1;
-            spore_str ex = spore_header_get(req, "Expect");
-            if (c->in_len < c->need && spore__ieq(ex, "100-continue")) {
+            if (c->in_len < c->need && expect) {
                 static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
                 if (send(c->fd, cont, sizeof cont - 1, SEND_FLAGS) !=
                     (ssize_t)(sizeof cont - 1))
@@ -810,6 +811,29 @@ static int peer_allowed(spore_server *s, int fd,
     return 0;
 }
 
+/* Register an accepted socket. Returns 0, or -1 (the caller closes fd). */
+static int add_conn(spore_server *s, int fd, int64_t now) {
+    int one = 1;
+    if (set_flags(fd) < 0) return -1;
+    if (!s->unix_path)
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+    conn *c = calloc(1, sizeof *c);
+    size_t cap = s->cfg.max_header + 1 < IN_INITIAL ? s->cfg.max_header + 1
+                                                     : IN_INITIAL;
+    if (!c || !(c->in = malloc(cap))) {
+        free(c);
+        return -1;
+    }
+    c->in_cap = cap;
+    c->fd = fd;
+    c->t_active = now;
+    s->conns[s->n_conns++] = c;
+    return 0;
+}
+
 static void accept_all(spore_server *s, int64_t now) {
     while (s->n_conns < s->cfg.max_conns) {
         struct sockaddr_storage ss;
@@ -819,27 +843,13 @@ static void accept_all(spore_server *s, int64_t now) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
             return; /* EAGAIN, or EMFILE and friends: retry next poll */
         }
-        int one = 1;
-        conn *c = NULL;
-        if (!peer_allowed(s, fd, &ss) || set_flags(fd) < 0) goto drop;
-        if (!s->unix_path)
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-#ifdef SO_NOSIGPIPE
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
-        c = calloc(1, sizeof *c);
-        size_t cap = s->cfg.max_header + 1 < IN_INITIAL ? s->cfg.max_header + 1
-                                                         : IN_INITIAL;
-        if (!c || !(c->in = malloc(cap))) goto drop;
-        c->in_cap = cap;
-        c->fd = fd;
-        c->t_active = now;
-        s->conns[s->n_conns++] = c;
-        continue;
-    drop:
-        if (c) free(c);
-        close(fd);
+        if (!peer_allowed(s, fd, &ss) || add_conn(s, fd, now) < 0) close(fd);
     }
+}
+
+int spore__adopt(spore_server *s, int fd) {
+    if (s->n_conns >= s->cfg.max_conns) return -1;
+    return add_conn(s, fd, now_ms());
 }
 
 /* When conn_service() would next act on a timeout, or INT64_MAX. */

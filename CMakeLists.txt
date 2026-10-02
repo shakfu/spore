@@ -51,6 +51,7 @@ set(SPORE_CORE_SRC src/buf.c src/http.c src/json.c src/server.c src/static.c)
 set(SPORE_WS_SRC   src/sha1.c src/ws.c)
 set(SPORE_LLM_SRC  src/llm.c)
 set(SPORE_RT_SRC   src/realtime.c src/rt_audio.c)
+set(SPORE_TEXT_SRC src/think.c) # shared by llm and realtime
 
 
 set(SPORE_SRC ${SPORE_CORE_SRC})
@@ -67,6 +68,7 @@ if(SPORE_REALTIME)
   list(APPEND SPORE_HEADERS include/spore_realtime.h)
 endif()
 if(SPORE_LLM OR SPORE_REALTIME) # realtime uses the backend types only
+  list(APPEND SPORE_SRC ${SPORE_TEXT_SRC})
   list(APPEND SPORE_HEADERS include/spore_llm.h)
 endif()
 
@@ -223,7 +225,7 @@ if(SPORE_BUILD_TESTS)
   add_test(NAME unit COMMAND test_unit)
 
   # Replay the fuzz seed corpus without libFuzzer, under any compiler.
-  set(replay_targets http json)
+  set(replay_targets http json conn)
   if(SPORE_WS)
     list(APPEND replay_targets ws)
   endif()
@@ -272,9 +274,9 @@ if(SPORE_FUZZ)
   if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "SPORE_FUZZ needs clang (e.g. -DCMAKE_C_COMPILER=clang)")
   endif()
-  foreach(t http json ws rt)
+  foreach(t http json ws rt conn)
     add_executable(fuzz_${t} tests/fuzz/fuzz_${t}.c ${SPORE_CORE_SRC} ${SPORE_WS_SRC}
-                   ${SPORE_RT_SRC})
+                   ${SPORE_RT_SRC} ${SPORE_TEXT_SRC})
     set_target_properties(fuzz_${t} PROPERTIES
       C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
     target_include_directories(fuzz_${t} PRIVATE include src)

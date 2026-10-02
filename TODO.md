@@ -6,69 +6,19 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md). 
 
 ## High
 
-- [x] Cap the per-response output buffer so a client that stops reading cannot grow it without bound.
-
-- [x] Prompt-prefix caching in `backends/llama` (keep the KV cache across turns).
-
-- [x] Multiple cache slots in `backends/llama`, so interleaved conversations do not evict each other.
-
-- [x] Register LLM routes so that an allocation failure in `spore_llm_new()` cannot leave routes pointing at a freed handle.
-
-- [x] Run `make fuzz-run` in CI with a time budget.
-
-- [ ] Run the Autobahn WebSocket testsuite against `/ws/echo`.
-
-- [x] Realtime phase 2: whisper.cpp `transcribe` and `spore_llama` generation behind `spore_rt_backend`, with llama.cpp's ggml shared by both.
-
-- [x] Realtime phase 3: port OuteTTS generation (cyllama's Python loop) to C++ as `synthesize`.
-
-- [x] Real-time TTS: measure OuteTTS-0.3-500M and GPU offload (RTX 4060: real-time factor 0.3-0.6).
-
-- [x] Stream the TTS vocoder in overlapping windows, to cut first-audio latency per sentence.
-
-- [x] Listening test: streamed vs whole-sentence TTS (3 sentences, no audible difference).
-
-- [x] Fuzz target for realtime client events.
-
-- [x] (net) Reword the scope claim in `README.md`: the listener cannot be bound elsewhere, but a forwarder on the host exposes it.
-
-- [x] (net) `spored --token-file PATH`: generate a token, write it mode `0600`, print a URL with the token in the fragment.
-
-- [x] (net) Deprecate `spored --token T`, or document that `ps` exposes it to other users.
-
-- [x] (net) State in `README.md` which transport to use: the Unix socket for non-browser clients, TCP with a token for browsers and forwarders.
-
-- [x] (net) Document a reverse-proxy setup that requires `token` and keeps the Host check effective.
+- [x] Run the Autobahn WebSocket testsuite against `/ws/echo`.
 
 ## Medium
 
-- [x] (net) Setting that disables the implicit loopback origins, so only `spore_config.origins` is accepted.
-
-- [x] (net) Allowed-hosts setting; apply the Host check on Unix sockets when it is set.
-
-- [x] Detect `POLLHUP` even when the input buffer is full.
-
-- [x] Keep a response alive after the client half-closes (EOF with an active response).
-
-- [x] Return backend error messages, so a prompt longer than the context gets a 400 that names the cause.
-
-- [x] Separate `<think>` output into `reasoning_content`.
-
-- [x] Bearer token for browser WebSocket clients (via `Sec-WebSocket-Protocol`).
-
-- [x] Compute the poll timeout from the nearest deadline instead of capping at 1 s.
-
-- [x] `POST /v1/audio/speech`: standalone TTS over the existing `spore_rt_tts` interface, returning WAV or raw PCM.
-
-- [ ] Fuzz target for the connection state machine: drive `spore_poll()` over a socketpair with fuzzed byte streams and split points.
+- [x] Fuzz target for the connection state machine: drive `spore_poll()` over a socketpair with fuzzed byte streams and split points.
 
 - [ ] Test half-close and `POLLHUP` handling on macOS; POSIX makes `POLLHUP` exclusive with `POLLOUT`, but macOS may raise it on a half-close alone.
 
-- [ ] Realtime: strip `<think>` blocks before TTS, so a thinking model's reasoning is not spoken.
+- [x] Realtime: strip `<think>` blocks before TTS, so a thinking model's reasoning is not spoken.
 
-- [ ] Detect a `<think>` block opened by the chat template (the reply starts inside it).
+- [x] Detect a `<think>` block opened by the chat template (the reply starts inside it).
 
-- [ ] Return a cause for embedding failures; `embed` returns only -1, so an over-long input gets a bare 500.
+- [x] Return a cause for embedding failures; `embed` returns only -1, so an over-long input gets a bare 500.
 
 ## Low
 

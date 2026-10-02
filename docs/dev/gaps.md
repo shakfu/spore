@@ -6,7 +6,6 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 | Gap | Effect | Suggested fix |
 |---|---|---|
-| Connection state machine not fuzzed | The fuzz targets cover the parsers only. Framing across reads, pipelining, `100-continue` and draining in `conn_service()` are covered only by the integration tests | A target that drives `spore_poll()` over a socketpair with fuzzed byte streams and split points |
 | A closed TCP client is seen only on write | EOF is a half-close, so a TCP client that closes is noticed when a write fails. A non-streaming LLM reply keeps generating until it ends. Unix-socket peers raise `POLLHUP` and are noticed at once | None that keeps half-close: TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing |
 | `POLLHUP` read as POSIX defines it | `POLLHUP` closes the connection: POSIX makes it exclusive with `POLLOUT`. If a platform raises it on a half-close alone, as macOS may, half-closed clients lose their responses there. Linux was tested; macOS was not | Test on macOS |
 
@@ -20,7 +19,7 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 ## WebSockets
 
-- **Autobahn not yet run.** `make autobahn` and the CI job run the [Autobahn testsuite](https://github.com/crossbario/autobahn-testsuite) against `/ws/echo`, but no result has been recorded: the development host has no Docker. Messages over 1 MiB (`max_message`) and compression cases are excluded.
+- **Autobahn: non-strict on fragmented UTF-8.** `make autobahn` (2026-10-02): 0 of 277 cases failed. 6.4.1-6.4.4 are non-strict because text is validated after reassembly (below). Messages over 1 MiB (`max_message`) and compression cases are excluded.
 
 - **No keep-alive pings.** On loopback and Unix sockets, the kernel closes a dead process's sockets, so a vanished peer is always seen. Pings would only detect a hung process, such as one stopped in a debugger. Browsers answer pings in their network stack, so a frozen tab would still pass.
 
@@ -66,10 +65,8 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 - **No batching.** One context behind a mutex. `workers > 1` gains nothing with `spore_llama`.
 
-- **Only a leading `<think>` block is separated.** A template that opens the block in the prompt (the reply starts inside it) is not detected. The realtime module passes the raw text to TTS, so a thinking model's reasoning would be spoken.
+- **Only a leading `<think>` block is separated.** A block opened by the chat template is detected only by a backend that emits the tag, as `spore_llama` does.
 
 - **Unsupported request features:** tool calls, image and audio content, `n > 1`, logprobs, token-array inputs to embeddings.
-
-- **Embedding errors are generic.** `embed` returns only -1, so an input longer than the batch gets 500 without a cause.
 
 - **Embeddings are printed with 17 digits.** Float vectors go out at double precision. That matches llama-server, but `%.9g` would round-trip float32 in about half the bytes. `encoding_format: "base64"` already avoids the cost.

@@ -96,7 +96,7 @@ make MODULES="ws"         # choose modules
 make test                 # ctest: unit tests, fuzz seed replay, pytest integration (needs uv)
 make asan tsan            # the same suites under sanitizers
 make check-modules        # build and test every module set
-make fuzz-run             # libFuzzer: HTTP, JSON, WebSocket, realtime events (clang), FUZZ_TIME=60 each
+make fuzz-run             # libFuzzer: HTTP, JSON, WebSocket, realtime events, connections (clang), FUZZ_TIME=60 each
 make autobahn             # Autobahn WebSocket testsuite against /ws/echo (Docker)
 make engines              # build/spored-engines with llama.cpp and whisper.cpp (LLAMA_DIR, WHISPER_DIR)
 make test-engines         # end-to-end with real models (MODELS=dir, ASR_SAMPLE=wav)
@@ -330,7 +330,7 @@ The backend keeps its KV cache between requests. It re-evaluates only the prompt
 
 All slots share one `n_ctx`-sized KV buffer, and attention spans every cell in it. With three other slots holding about 2k tokens each, generation with Qwen3-0.6B on CPU drops from 67.6 to 58.0 tokens/s. `--slots 1` restores the single-cache behaviour. As in llama-server, cached and uncached runs can differ in their greedy output, because logits depend on batch shape. Send `"cache_prompt": false` for reproducible output.
 
-A leading `<think>` block in a chat reply, as Qwen3 emits, goes to `reasoning_content`, streamed or not. Send `"reasoning_format": "none"` for the raw text. Models whose chat template opens the block in the prompt, so the reply starts inside it, are not detected.
+A leading `<think>` block in a chat reply, as Qwen3 emits, goes to `reasoning_content`, streamed or not. Send `"reasoning_format": "none"` for the raw text. When the chat template opens the block in the prompt, `spore_llama` emits the tag first, so the reply is split the same way. The realtime module neither sends nor speaks the block.
 
 A backend can reject a request with a message: `SPORE_LLM_INVALID` becomes a 400, `SPORE_LLM_ERROR` a 500, both with the backend's text. A streamed request gets the status too, because the stream head waits for the first event. The llama backend answers a prompt longer than the context with "the prompt has N tokens; the context holds M".
 

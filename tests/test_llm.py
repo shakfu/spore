@@ -229,6 +229,19 @@ def test_embeddings_reject_token_arrays(srv):
     assert status == 400
 
 
+@pytest.mark.parametrize("inp", ["", ["a", ""]])
+def test_embeddings_reject_empty_input(srv, inp):
+    status, r = post(srv, "/v1/embeddings", {"input": inp})
+    assert status == 400 and "non-empty" in r["error"]["message"]
+
+
+def test_embedding_error_names_cause(srv):
+    status, r = post(srv, "/v1/embeddings", {"input": ["ok", "x" * 65]})
+    assert status == 400
+    assert r["error"]["message"] == "input 1: echo: 65 bytes; the limit is 64"
+    assert r["error"]["type"] == "invalid_request_error"
+
+
 def test_disconnect_cancels_generation(spawn):
     srv = spawn("--workers", "1")
     words = "slow:" + " w" * 60  # ~3 s if it ran to completion

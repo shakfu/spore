@@ -980,12 +980,14 @@ typedef struct {
     session *s;
     response *r;
     item *it;           /* the assistant item */
-    spore_buf text;     /* all generated text */
+    spore_buf text;     /* generated text without the <think> block */
     size_t sent;        /* text mode: bytes sent as deltas */
     size_t spoken;      /* audio mode: bytes handed to synthesis */
     spore_buf said;     /* audio mode: transcript actually sent */
     char *voice;
     int failed;
+    spore_buf raw;      /* all generated text */
+    spore__think th;    /* reasoning is neither sent nor spoken */
 } gen;
 
 static int stopped(gen *g) {
@@ -1067,10 +1069,17 @@ static size_t sentence_end(const char *s, size_t from, size_t end) {
     return end - from > 400 ? spore__utf8_cut(s, from, end) : 0;
 }
 
+static void keep_text(void *vg, int think, const char *p, size_t n) {
+    gen *g = vg;
+    if (!think) spore_buf_add(&g->text, p, n);
+}
+
 static int emit_text(void *vg, const char *text, size_t len) {
     gen *g = vg;
     if (stopped(g)) return 1;
-    spore_buf_add(&g->text, text, len);
+    spore_buf_add(&g->raw, text, len);
+    if (g->raw.err) return 1;
+    spore__think_advance(&g->th, g->raw.ptr, g->raw.len, 0, keep_text, g);
     if (g->text.err) return 1;
     if (!g->r->audio) {
         size_t safe = spore__utf8_cut(g->text.ptr, g->sent, g->text.len);
@@ -1204,7 +1213,7 @@ static spore_llm_msg *build_messages(session *s, response *r, size_t *n,
 
 static void run_response(session *s, response *r) {
     const spore_rt_backend *be = &s->rt->be;
-    gen g = {s, r, NULL, {0}, 0, 0, {0}, NULL, 0};
+    gen g = {.s = s, .r = r};
     spore_llm_usage usage = {0};
     spore_llm_msg *msgs = NULL;
     char *strings = NULL;
@@ -1253,6 +1262,7 @@ static void run_response(session *s, response *r) {
                               .cache_prompt = 1};
         fin = be->llm.generate(be->llm.self, &p, emit_text, &g, &usage);
         usage.error[sizeof usage.error - 1] = '\0';
+        if (!g.raw.err) spore__think_advance(&g.th, g.raw.ptr, g.raw.len, 1, keep_text, &g);
         if (r->audio && !stopped(&g) && g.spoken < g.text.len)
             speak(&g, g.spoken, g.text.len);
         if (!r->audio && !stopped(&g) && g.sent < g.text.len) {
@@ -1273,7 +1283,7 @@ static void run_response(session *s, response *r) {
         status = dtype = "cancelled";
         reason = r->reason ? r->reason : "client_cancelled";
     } else if (!g.it || fin == SPORE_LLM_ERROR || fin == SPORE_LLM_INVALID ||
-               g.failed || g.text.err) {
+               g.failed || g.text.err || g.raw.err) {
         status = dtype = "failed";
     } else if (fin == SPORE_LLM_LENGTH) {
         status = dtype = "incomplete";
@@ -1319,6 +1329,7 @@ static void run_response(session *s, response *r) {
     s->active = NULL;
     pthread_mutex_unlock(&s->mu);
     spore_buf_free(&g.text);
+    spore_buf_free(&g.raw);
     spore_buf_free(&g.said);
     free(g.voice);
     response_free(r);

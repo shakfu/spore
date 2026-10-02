@@ -57,6 +57,9 @@ size_t spore__pending(spore_resp *resp); /* queued, unsent bytes */
 /* A response with no server or connection, in raw streaming mode, for
  * driving protocol code in tests and fuzzers. */
 spore_resp *spore__resp_detached(void);
+/* Serve an already connected socket, bypassing the peer check; the server
+ * owns fd on success. For tests/fuzz/fuzz_conn.c. Returns 0 or -1. */
+int spore__adopt(spore_server *srv, int fd);
 
 /* ---- WebSocket test entry points (ws.c) ------------------------------ */
 
@@ -91,6 +94,26 @@ int spore__utf8_valid(const char *s, size_t n);           /* json.c */
  * UTF-8 sequence. For streaming text in fragments. */
 size_t spore__utf8_cut(const char *s, size_t start, size_t end);
 void spore__sha1(const void *data, size_t len, unsigned char out[20]);
+
+/* ---- reasoning split (think.c; llm and realtime) ---------------------- */
+
+/* Splits a leading <think> block, as Qwen3 emits, from the reply, with the
+ * whitespace around it trimmed. A zeroed struct detects the block;
+ * SPORE__THINK_CONTENT passes everything as content. */
+enum { SPORE__THINK_DETECT, SPORE__THINK_IN_TRIM, SPORE__THINK_IN,
+       SPORE__THINK_OUT_TRIM, SPORE__THINK_CONTENT };
+typedef struct {
+    int mode;
+    size_t sent; /* text consumed so far */
+} spore__think;
+/* First occurrence of n[0..nl) in h[0..hl), or NULL. */
+const char *spore__find(const char *h, size_t hl, const char *n, size_t nl);
+typedef void (*spore__think_fn)(void *ctx, int think, const char *p, size_t n);
+/* Pass a[sent..to) to `fn`, as reasoning (think = 1) or content. Unless
+ * `final`, text that may still be (part of) a tag, or whitespace to trim,
+ * is held back. */
+void spore__think_advance(spore__think *t, const char *a, size_t to, int final,
+                          spore__think_fn fn, void *ctx);
 
 /* ---- realtime audio (rt_audio.c) ------------------------------------- */
 

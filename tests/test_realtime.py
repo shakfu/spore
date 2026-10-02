@@ -200,6 +200,20 @@ def test_audio_response(rt):
     assert out["content"] == [{"type": "output_audio", "transcript": transcript}] and out["status"] == "completed"
 
 
+@pytest.mark.parametrize("modality", ["audio", "text"])
+def test_think_block_is_not_sent_or_spoken(rt, modality):
+    rt.text_item("chop:<think>plan. more plan</think>\n\nsay this.")
+    rt.until("conversation.item.done")
+    rt.send(type="response.create", response={"output_modalities": [modality]})
+    evs = rt.until("response.done")
+    kind = "output_audio_transcript" if modality == "audio" else "output_text"
+    said = "".join(e["delta"] for e in evs if e["type"] == f"response.{kind}.delta")
+    assert said == "say this."
+    if modality == "audio":
+        assert audio_ms(evs) == pytest.approx(5 * len(said), abs=1)
+    assert evs[-1]["response"]["status"] == "completed"
+
+
 def test_max_output_tokens_gives_incomplete(rt):
     rt.text_item("one two three four")
     rt.until("conversation.item.done")

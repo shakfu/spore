@@ -9,9 +9,9 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
-      # Per target, four targets: 10 min nightly, 2 min per push.
+      # Per target, five targets: 10 min nightly, 2 min per push.
       FUZZ_TIME: ${{ github.event_name == 'schedule' && 600 || 120 }}
     steps:
       - uses: actions/checkout@v4

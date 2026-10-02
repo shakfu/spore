@@ -7,6 +7,7 @@
  *   "invalid:" return SPORE_LLM_INVALID before any output
  *   "bytes:"  emit one byte at a time, splitting UTF-8 sequences
  *   "chop:"   emit the text after the prefix one byte at a time
+ * Embedding inputs over 64 bytes are rejected, as over-long input.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "echo_backend.h"
@@ -72,13 +73,17 @@ static spore_llm_finish generate(void *self, const spore_llm_params *p,
 }
 
 /* A fixed pseudo-embedding: byte histogram folded into DIM buckets. */
-static int embed(void *self, const char *text, size_t len, float *out,
-                 int *n_tokens) {
+static spore_llm_finish embed(void *self, const char *text, size_t len,
+                              float *out, spore_llm_usage *u) {
     (void)self;
+    if (len > 64) {
+        snprintf(u->error, sizeof u->error, "echo: %zu bytes; the limit is 64", len);
+        return SPORE_LLM_INVALID;
+    }
     memset(out, 0, DIM * sizeof *out);
     for (size_t i = 0; i < len; i++) out[(unsigned char)text[i] % DIM] += 1.0f;
-    *n_tokens = (int)len;
-    return 0;
+    u->prompt_tokens = (int)len;
+    return SPORE_LLM_STOP;
 }
 
 spore_llm_backend echo_backend(void) {

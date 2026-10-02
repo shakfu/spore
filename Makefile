@@ -72,10 +72,10 @@ check-modules:
 fuzz:
 	@$(CMAKE) -S . -B $(FUZZ) -DCMAKE_C_COMPILER=$(FUZZ_CC) -DSPORE_FUZZ=ON \
 		-DSPORE_BUILD_TESTS=OFF -DSPORE_BUILD_EXAMPLES=OFF > /dev/null
-	$(CMAKE) --build $(FUZZ) -j$(JOBS) --target fuzz_http fuzz_json fuzz_ws fuzz_rt
+	$(CMAKE) --build $(FUZZ) -j$(JOBS) --target fuzz_http fuzz_json fuzz_ws fuzz_rt fuzz_conn
 
 fuzz-run: fuzz
-	for t in http json ws rt; do \
+	for t in http json ws rt conn; do \
 		mkdir -p $(FUZZ)/corpus-$$t; \
 		$(FUZZ)/fuzz_$$t -max_total_time=$(FUZZ_TIME) -dict=tests/fuzz/$$t.dict \
 			-artifact_prefix=$(FUZZ)/ $(FUZZ)/corpus-$$t tests/fuzz/seeds/$$t || exit 1; \

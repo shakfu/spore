@@ -74,6 +74,16 @@ Initial release.
 
 - `POST /v1/audio/speech` in the realtime module when a TTS stage is configured: WAV (whole) or raw PCM (streamed), at most 4 concurrent requests.
 
+- `fuzz_conn`: the connection state machine. It drives `spore_poll()` over a socketpair with fuzzed bytes and split points, against echo, streaming and deferred handlers. After a half-close, the server must answer and close within 256 polls. `spore__adopt()` serves an already connected socket for it.
+
+- Autobahn testsuite, first recorded run: 0 of 277 cases failed. 6.4.1-6.4.4 are non-strict: invalid UTF-8 in a fragmented message is detected after reassembly (see `docs/dev/gaps.md`). 7.1.6, 7.13.1 and 7.13.2 are informational.
+
+- Realtime: a leading `<think>` block is neither sent nor spoken. Before, a thinking model's reasoning went to TTS.
+
+- `backends/llama`: when the chat template opens a `<think>` block in the prompt (llama.cpp's `bailing-think`), the backend emits the tag first, so the reasoning is separated. `spore_llm` cannot detect this itself without buffering the whole reply.
+
+- `spore_llm_backend.embed` returns `spore_llm_finish` and fills a `spore_llm_usage`, as `generate` does. Errors name their cause, and `SPORE_LLM_INVALID` gives 400. The llama backend reports an input over `n_batch` with both token counts; before, it was a bare 500. Empty inputs get 400.
+
 ### Fixed before release
 
 - Lost wake-up in the event loop. The loop cleared `wake_pending` before draining the wake pipe. A worker byte written between the two was drained, but the flag stayed set, so no later worker wrote again. Every cross-thread reply then waited for the 1 s poll cap. `test_no_lost_wakeups_under_streaming` measures the stall.
@@ -85,3 +95,5 @@ Initial release.
 - Non-streaming LLM requests were not cancelled when the client disconnected. Only a failed write stopped generation, and a non-streaming reply writes nothing until the end.
 
 - An absent query string was `{NULL, 0}`, so `spore_query_get()` computed `NULL + 0` (undefined behaviour). It is now an empty span at the end of the target. Found by `fuzz_http` under UBSan.
+
+- Heap use-after-free on a request whose body grows the input buffer. The `Expect` lookup ran after the realloc, through header spans into the freed buffer. A six-letter header name (`Accept`, `Origin`, `Cookie`) made the comparison read those bytes. Found by `fuzz_conn` in about 20 s.

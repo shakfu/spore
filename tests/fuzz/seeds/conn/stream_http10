@@ -1,0 +1,5 @@
+?POST /stream HTTP/1.0
+Host: localhost
+Content-Length: 2
+
+xy

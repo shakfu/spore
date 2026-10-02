@@ -69,14 +69,17 @@ typedef enum {
 typedef struct {
     const char *model; /* id reported by /v1/models and in responses */
     void *self;
-    /* NULL disables the completion routes. */
+    /* NULL disables the completion routes. When a chat template opens a
+     * <think> block in the prompt, emit "<think>" first, so the reasoning
+     * can be separated as if the model had opened the block. */
     spore_llm_finish (*generate)(void *self, const spore_llm_params *p,
                                  spore_llm_emit emit, void *ctx,
                                  spore_llm_usage *usage);
-    /* NULL disables /v1/embeddings. Writes embed_dim floats to `out`.
-     * Returns 0, or -1 on failure. */
-    int (*embed)(void *self, const char *text, size_t len, float *out,
-                 int *n_tokens);
+    /* NULL disables /v1/embeddings. Writes embed_dim floats to `out` and
+     * sets usage->prompt_tokens. Returns SPORE_LLM_STOP on success, else
+     * SPORE_LLM_ERROR or SPORE_LLM_INVALID with usage->error set. */
+    spore_llm_finish (*embed)(void *self, const char *text, size_t len,
+                              float *out, spore_llm_usage *usage);
     size_t embed_dim;
 } spore_llm_backend;
 

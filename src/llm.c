@@ -34,7 +34,7 @@ typedef struct job {
     int base64;
     char id[48];
     long created;
-    char errbuf[96];
+    char errbuf[192];
 } job;
 
 struct spore_llm {
@@ -253,10 +253,10 @@ static int parse_embed(job *j, const spore_jnode *o, const char **err) {
     if (in && in->type == SPORE_JARR && in->len) {
         for (const spore_jnode *e = spore_json_child(d, in); e;
              e = spore_json_next(d, e))
-            if (e->type != SPORE_JSTR)
-                FAIL("'input' must be a string or an array of strings");
-    } else if (!in || in->type != SPORE_JSTR) {
-        FAIL("'input' must be a string or an array of strings");
+            if (e->type != SPORE_JSTR || !e->len)
+                FAIL("'input' must be a non-empty string or an array of them");
+    } else if (!in || in->type != SPORE_JSTR || !in->len) {
+        FAIL("'input' must be a non-empty string or an array of them");
     }
     j->input = in;
     const spore_jnode *f = spore_json_get(d, o, "encoding_format");
@@ -328,24 +328,12 @@ typedef struct {
     spore_llm *llm;
     job *j;
     spore_buf acc; /* all generated text */
-    size_t sent;   /* acc prefix already streamed, or checked for stops */
     int matched;   /* a stop sequence ended generation */
     int dead;      /* client gone or shutting down */
     int begun;     /* stream head sent */
-    int mode;      /* R_*: where acc[sent..] goes */
-    spore_buf content, reasoning; /* the split of acc[..sent) */
+    spore__think th; /* th.sent: acc prefix streamed, or checked for stops */
+    spore_buf content, reasoning; /* the split of acc[..th.sent) */
 } gen;
-
-/* A leading <think> block, as Qwen3 emits, goes to
- * reasoning_content, with the whitespace around it trimmed. */
-enum { R_DETECT, R_THINK_TRIM, R_THINK, R_CONTENT_TRIM, R_CONTENT };
-
-static const char *find(const char *h, size_t hl, const char *n, size_t nl) {
-    if (nl > hl) return NULL;
-    for (size_t i = 0; i + nl <= hl; i++)
-        if (h[i] == n[0] && memcmp(h + i, n, nl) == 0) return h + i;
-    return NULL;
-}
 
 static void chunk_head(gen *g, spore_buf *b) {
     job *j = g->j;
@@ -409,73 +397,15 @@ static void send_delta(gen *g, const char *field, const char *text, size_t len,
     send_event(g, &b);
 }
 
-static void out(gen *g, int think, size_t to) {
-    if (to <= g->sent) return;
-    const char *p = g->acc.ptr + g->sent;
-    size_t n = to - g->sent;
+static void out(void *ctx, int think, const char *p, size_t n) {
+    gen *g = ctx;
     spore_buf_add(think ? &g->reasoning : &g->content, p, n);
     if (g->j->stream)
         send_delta(g, think ? "reasoning_content" : "content", p, n, NULL);
-    g->sent = to;
 }
 
-static int space(char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
-
-/* Pass acc[sent..to) on. Unless `final`, text that may still turn out to
- * be (part of) a tag, or whitespace to trim, is held back. */
 static void advance(gen *g, size_t to, int final) {
-    static const char open[] = "<think>", close[] = "</think>";
-    const char *a = g->acc.ptr;
-    while (g->sent < to) {
-        size_t i = g->sent;
-        switch (g->mode) {
-        case R_DETECT: {
-            while (i < to && space(a[i])) i++;
-            size_t m = to - i < 7 ? to - i : 7;
-            if (memcmp(a + i, open, m) != 0) {
-                g->mode = R_CONTENT;
-            } else if (m == 7) {
-                g->sent = i + 7;
-                g->mode = R_THINK_TRIM;
-            } else if (final) {
-                g->mode = R_CONTENT;
-            } else {
-                return;
-            }
-            break;
-        }
-        case R_THINK_TRIM:
-        case R_CONTENT_TRIM:
-            while (i < to && space(a[i])) i++;
-            g->sent = i;
-            if (i == to && !final) return;
-            g->mode = g->mode == R_THINK_TRIM ? R_THINK : R_CONTENT;
-            break;
-        case R_THINK: {
-            const char *e = find(a + i, to - i, close, 8);
-            size_t end = e ? (size_t)(e - a) : to;
-            if (!e && !final) /* hold a partial "</think>" */
-                for (size_t h = 7; h > 0; h--)
-                    if (to - i >= h && memcmp(a + to - h, close, h) == 0) {
-                        end = to - h;
-                        break;
-                    }
-            size_t keep = end; /* trailing whitespace waits for more text */
-            while (keep > i && space(a[keep - 1])) keep--;
-            out(g, 1, keep);
-            if (e) {
-                g->sent = end + 8;
-                g->mode = R_CONTENT_TRIM;
-            } else {
-                if (final) g->sent = to;
-                return;
-            }
-            break;
-        }
-        default:
-            out(g, 0, to);
-        }
-    }
+    spore__think_advance(&g->th, g->acc.ptr, to, final, out, g);
 }
 
 static int emit(void *ctx, const char *text, size_t len) {
@@ -495,7 +425,7 @@ static int emit(void *ctx, const char *text, size_t len) {
     /* No stop match can start before `sent`; see the holdback below. */
     const char *first = NULL;
     for (size_t i = 0; i < j->n_stop; i++) {
-        const char *m = find(g->acc.ptr + g->sent, g->acc.len - g->sent,
+        const char *m = spore__find(g->acc.ptr + g->th.sent, g->acc.len - g->th.sent,
                              j->stop[i], strlen(j->stop[i]));
         if (m && (!first || m < first)) first = m;
     }
@@ -509,14 +439,14 @@ static int emit(void *ctx, const char *text, size_t len) {
     size_t hold = 0;
     for (size_t i = 0; i < j->n_stop; i++) {
         size_t sl = strlen(j->stop[i]);
-        size_t max = sl - 1 < g->acc.len - g->sent ? sl - 1 : g->acc.len - g->sent;
+        size_t max = sl - 1 < g->acc.len - g->th.sent ? sl - 1 : g->acc.len - g->th.sent;
         for (size_t h = max; h > hold; h--)
             if (memcmp(g->acc.ptr + g->acc.len - h, j->stop[i], h) == 0) {
                 hold = h;
                 break;
             }
     }
-    advance(g, spore__utf8_cut(g->acc.ptr, g->sent, g->acc.len - hold), 0);
+    advance(g, spore__utf8_cut(g->acc.ptr, g->th.sent, g->acc.len - hold), 0);
     return g->dead;
 }
 
@@ -534,7 +464,7 @@ static void usage_json(spore_buf *b, const spore_llm_usage *u) {
 }
 
 static void run_generate(spore_llm *llm, job *j) {
-    gen g = {.llm = llm, .j = j, .mode = j->reasoning ? R_DETECT : R_CONTENT};
+    gen g = {.llm = llm, .j = j, .th.mode = j->reasoning ? SPORE__THINK_DETECT : SPORE__THINK_CONTENT};
     spore_llm_usage usage = {0};
     spore_llm_finish f = llm->be.generate(llm->be.self, &j->p, emit, &g, &usage);
     if (!g.dead) advance(&g, g.acc.len, 1);
@@ -617,15 +547,20 @@ static void run_embed(spore_llm *llm, job *j) {
     long tokens = 0;
     for (size_t i = 0; e; i++, e = j->input->type == SPORE_JARR
                                        ? spore_json_next(d, e) : NULL) {
-        int nt = 0;
-        if (spore_closed(j->resp) || atomic_load(&llm->shutdown) ||
-            llm->be.embed(llm->be.self, e->str, e->len, vec, &nt)) {
+        spore_llm_usage use = {0};
+        spore_llm_finish f = SPORE_LLM_ERROR;
+        if (!spore_closed(j->resp) && !atomic_load(&llm->shutdown))
+            f = llm->be.embed(llm->be.self, e->str, e->len, vec, &use);
+        if (f != SPORE_LLM_STOP) {
+            use.error[sizeof use.error - 1] = '\0';
+            snprintf(j->errbuf, sizeof j->errbuf, "input %zu: %s", i,
+                     use.error[0] ? use.error : "embedding failed");
             free(vec);
             spore_buf_free(&b);
-            reply_error(j->resp, 500, "embedding failed");
+            reply_error(j->resp, f == SPORE_LLM_INVALID ? 400 : 500, j->errbuf);
             return;
         }
-        tokens += nt;
+        tokens += use.prompt_tokens;
         spore_buf_printf(&b, "%s{\"object\":\"embedding\",\"index\":%zu,"
                              "\"embedding\":", i ? "," : "", i);
         if (j->base64) {

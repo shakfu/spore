@@ -116,6 +116,19 @@ def test_body_echo_split_across_writes(srv):
     assert status == 200 and got == body and h["content-type"] == "application/x-test"
 
 
+def test_body_that_grows_buffer_with_six_letter_header(srv):
+    # Regression: a 6-letter header name made the Expect lookup read the
+    # head from the buffer the body realloc had freed (caught under ASan).
+    body = b"y" * 100000
+    with srv.connect() as s:
+        s.sendall(
+            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        assert read_response(s)[2] == body
+
+
 def test_expect_100_continue(srv):
     with srv.connect() as s:
         s.sendall(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")

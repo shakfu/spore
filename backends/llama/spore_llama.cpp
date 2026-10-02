@@ -73,6 +73,12 @@ bool apply_template(backend *b, const spore_llm_params *p, std::string &out) {
     return true;
 }
 
+// The prompt ends inside a <think> block that the template opened.
+bool opens_think(const std::string &prompt) {
+    size_t n = prompt.find_last_not_of(" \t\r\n");
+    return n != std::string::npos && n >= 6 && prompt.compare(n - 6, 7, "<think>") == 0;
+}
+
 llama_sampler *make_sampler(const spore_llm_params *p) {
     llama_sampler *s =
         llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -199,6 +205,9 @@ spore_llm_finish run(backend *b, const spore_llm_params *p, spore_llm_emit emit,
         cached.insert(cached.end(), toks.begin() + i, toks.begin() + i + n);
     }
 
+    // Restore the tag, so the reply can be split like one that opens it.
+    if (p->messages && opens_think(prompt) && emit(ectx, "<think>", 7))
+        return SPORE_LLM_STOP;
     llama_sampler *smpl = make_sampler(p);
     spore_llm_finish fin = SPORE_LLM_STOP;
     std::vector<char> piece(256);
@@ -241,15 +250,22 @@ spore_llm_finish generate(void *self, const spore_llm_params *p,
     }
 }
 
-int embed(void *self, const char *text, size_t len, float *out,
-          int *n_tokens) {
+spore_llm_finish embed(void *self, const char *text, size_t len, float *out,
+                       spore_llm_usage *usage) {
     backend *b = static_cast<backend *>(self);
     std::lock_guard<std::mutex> lock(b->mu);
     try {
         std::vector<llama_token> toks;
-        if (!tokenize(b->vocab, std::string(text, len), false, toks)) return -1;
+        if (!tokenize(b->vocab, std::string(text, len), false, toks))
+            return error(usage, SPORE_LLM_ERROR, "tokenization failed");
         const int n = (int)toks.size();
-        if (n > (int)llama_n_batch(b->ctx)) return -1;
+        const int n_batch = (int)llama_n_batch(b->ctx);
+        usage->prompt_tokens = n;
+        if (n > n_batch) {
+            snprintf(usage->error, sizeof usage->error,
+                     "the input has %d tokens; the limit is %d", n, n_batch);
+            return SPORE_LLM_INVALID;
+        }
         llama_memory_clear(llama_get_memory(b->ctx), true);
         llama_batch batch = llama_batch_init(n, 0, 1);
         for (int i = 0; i < n; i++) {
@@ -264,18 +280,20 @@ int embed(void *self, const char *text, size_t len, float *out,
                      ? llama_encode(b->ctx, batch)
                      : llama_decode(b->ctx, batch);
         llama_batch_free(batch);
-        if (rc) return -1;
+        if (rc) {
+            snprintf(usage->error, sizeof usage->error, "llama_decode failed (%d)", rc);
+            return SPORE_LLM_ERROR;
+        }
         const float *e = llama_get_embeddings_seq(b->ctx, 0);
-        if (!e) return -1;
+        if (!e) return error(usage, SPORE_LLM_ERROR, "the model returned no embedding");
         // L2-normalise, as the OpenAI endpoint and llama-server do.
         double sum = 0;
         for (size_t i = 0; i < b->be.embed_dim; i++) sum += (double)e[i] * e[i];
         const float scale = sum > 0 ? (float)(1.0 / std::sqrt(sum)) : 0.0f;
         for (size_t i = 0; i < b->be.embed_dim; i++) out[i] = e[i] * scale;
-        *n_tokens = n;
-        return 0;
+        return SPORE_LLM_STOP;
     } catch (...) {
-        return -1;
+        return error(usage, SPORE_LLM_ERROR, "internal error");
     }
 }
 
