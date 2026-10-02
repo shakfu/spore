@@ -4,8 +4,6 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md). 
 
 ## Critical
 
-- [ ] Run a token-similarity check (JPlag) against Mongoose before the first release.
-
 ## High
 
 - [ ] Cap the per-response output buffer so a client that stops reading cannot grow it without bound.
