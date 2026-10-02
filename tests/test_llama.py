@@ -78,11 +78,13 @@ def test_max_tokens_and_stop(chat_port):
     assert r.choices[0].finish_reason == "stop" and "7" not in r.choices[0].text
 
 
-def test_prompt_longer_than_context_fails_cleanly(chat_port):
+def test_prompt_longer_than_context_is_400(chat_port):
     c = client(chat_port)
     openai = pytest.importorskip("openai")
-    with pytest.raises(openai.InternalServerError):
+    with pytest.raises(openai.BadRequestError, match="the context holds 2048"):
         c.completions.create(model="m", prompt="word " * 5000, max_tokens=1)
+    with pytest.raises(openai.BadRequestError, match="the context holds 2048"):
+        c.completions.create(model="m", prompt="word " * 5000, max_tokens=1, stream=True)
 
 
 def test_embeddings_are_normalised_and_semantic(embed_port):
@@ -136,3 +138,46 @@ def test_uncached_greedy_is_reproducible(chat_port):
         for _ in range(2)
     ]
     assert runs[0] == runs[1]
+
+
+def test_interleaved_conversations_keep_their_caches(chat_port):
+    c = client(chat_port)
+    system = {"role": "system", "content": "Table: " + " ".join(f"g{i}={i + 7}." for i in range(80))}
+
+    def ask(msgs):
+        return c.chat.completions.create(model="m", messages=msgs, temperature=0, max_tokens=8)
+
+    def cached(r):
+        return r.usage.prompt_tokens_details.cached_tokens
+
+    notes = "Notes: " + " ".join(f"n{i}" for i in range(60)) + ". "
+    a1 = [system, {"role": "user", "content": notes + "What is g2? /no_think"}]
+    b1 = [system, {"role": "user", "content": "What is g9? Answer in words. /no_think"}]
+    ra = ask(a1)
+    rb = ask(b1)
+    # B shares only the system prompt with A; that prefix is reused.
+    assert cached(rb) > 100
+    # A's follow-up still finds its own turn, notes included: B did not
+    # evict it.
+    a2 = a1 + [
+        {"role": "assistant", "content": ra.choices[0].message.content},
+        {"role": "user", "content": "And g3? /no_think"},
+    ]
+    r = ask(a2)
+    assert cached(r) >= ra.usage.prompt_tokens - 8
+    b2 = b1 + [
+        {"role": "assistant", "content": rb.choices[0].message.content},
+        {"role": "user", "content": "And g4? /no_think"},
+    ]
+    r = ask(b2)
+    assert cached(r) >= rb.usage.prompt_tokens - 8
+
+
+def test_qwen3_thinking_goes_to_reasoning_content(chat_port):
+    c = client(chat_port)
+    r = c.chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "What is 2+2?"}], temperature=0, max_tokens=400
+    )
+    msg = r.choices[0].message.model_dump()
+    assert msg.get("reasoning_content")
+    assert "<think>" not in msg["reasoning_content"] and "think>" not in (msg["content"] or "")

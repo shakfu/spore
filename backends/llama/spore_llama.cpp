@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 //
 // One context, serialised by a mutex, with no batching across requests.
-// The KV cache persists between requests: each request reuses the longest
-// token prefix it shares with the previous one (prompt caching).
+// The KV cache persists between requests (prompt caching). Each cache slot
+// is a llama.cpp sequence in one unified KV buffer, so interleaved
+// conversations keep their own prefixes, and a prefix shared between
+// slots (a common system prompt) occupies its cells once.
 #include "spore_llama.h"
 
 #include "llama.h"
@@ -18,6 +20,11 @@
 
 namespace {
 
+struct slot {
+    std::vector<llama_token> cached; // tokens whose KV entries are in this seq
+    uint64_t used = 0;               // last use, for LRU
+};
+
 struct backend {
     spore_llm_backend be; // the C API hands out &be; be.self leads back
     llama_model *model = nullptr;
@@ -25,7 +32,10 @@ struct backend {
     const llama_vocab *vocab = nullptr;
     std::string name;
     std::mutex mu;
-    std::vector<llama_token> cached; // tokens whose KV entries are in seq 0
+    std::vector<slot> slots; // index = llama seq id
+    uint64_t clock = 0;
+    llama_batch batch{};
+    int n_batch = 0;
 };
 
 void log_warnings(ggml_log_level level, const char *text, void *) {
@@ -78,52 +88,115 @@ llama_sampler *make_sampler(const spore_llm_params *p) {
     return s;
 }
 
+spore_llm_finish error(spore_llm_usage *u, spore_llm_finish f, const char *msg) {
+    snprintf(u->error, sizeof u->error, "%s", msg);
+    return f;
+}
+
 // A failed decode leaves the KV state unknown: forget it.
-spore_llm_finish fail(backend *b) {
+spore_llm_finish fail(backend *b, spore_llm_usage *u, int rc) {
     llama_memory_clear(llama_get_memory(b->ctx), true);
-    b->cached.clear();
+    for (slot &s : b->slots) s.cached.clear();
+    snprintf(u->error, sizeof u->error,
+             rc == 1 ? "the KV cache is full" : "llama_decode failed (%d)", rc);
     return SPORE_LLM_ERROR;
+}
+
+// Decode n tokens of `seq` from position `pos`; logits for the last only.
+// When the KV buffer is full, evict other slots, least recently used first.
+int decode(backend *b, int seq, const llama_token *t, int n, int pos) {
+    llama_batch &bt = b->batch;
+    for (int i = 0; i < n; i++) {
+        bt.token[i] = t[i];
+        bt.pos[i] = pos + i;
+        bt.n_seq_id[i] = 1;
+        bt.seq_id[i][0] = seq;
+        bt.logits[i] = i == n - 1;
+    }
+    bt.n_tokens = n;
+    for (;;) {
+        int rc = llama_decode(b->ctx, bt);
+        if (rc != 1) return rc; // 1: no room; the KV state is unchanged
+        int victim = -1;
+        for (int i = 0; i < (int)b->slots.size(); i++)
+            if (i != seq && !b->slots[(size_t)i].cached.empty() &&
+                (victim < 0 || b->slots[(size_t)i].used < b->slots[(size_t)victim].used))
+                victim = i;
+        if (victim < 0) return rc;
+        llama_memory_seq_rm(llama_get_memory(b->ctx), victim, -1, -1);
+        b->slots[(size_t)victim].cached.clear();
+    }
+}
+
+// Pick the slot for `toks` and prepare its KV state. Returns the slot and
+// sets `keep` to the prefix length already evaluated in it. The slot with
+// the longest shared prefix is extended in place when that discards at most
+// one token; otherwise the prefix is copied into the least recently used
+// slot, so a conversation that only shares a system prompt is not evicted.
+int prepare_slot(backend *b, const std::vector<llama_token> &toks, bool reuse,
+                 size_t &keep) {
+    size_t best = 0, lru = 0;
+    keep = 0;
+    for (size_t i = 0; i < b->slots.size(); i++) {
+        const std::vector<llama_token> &c = b->slots[i].cached;
+        size_t k = 0;
+        while (reuse && k < c.size() && k < toks.size() && c[k] == toks[k]) k++;
+        if (k > keep) keep = k, best = i;
+        if (b->slots[i].used < b->slots[lru].used) lru = i;
+    }
+    // Always re-decode at least one prompt token: sampling needs its logits.
+    if (keep == toks.size()) keep--;
+    llama_memory_t mem = llama_get_memory(b->ctx);
+    size_t seq = keep && b->slots[best].cached.size() <= keep + 1 ? best : lru;
+    if (seq != best) {
+        llama_memory_seq_rm(mem, (llama_seq_id)seq, -1, -1);
+        if (keep) llama_memory_seq_cp(mem, (llama_seq_id)best, (llama_seq_id)seq, 0,
+                                      (llama_pos)keep);
+        b->slots[seq].cached.assign(b->slots[best].cached.begin(),
+                                    b->slots[best].cached.begin() + (long)keep);
+    }
+    if (!llama_memory_seq_rm(mem, (llama_seq_id)seq, (llama_pos)keep, -1)) {
+        llama_memory_seq_rm(mem, (llama_seq_id)seq, -1, -1); // recurrent: no partial removal
+        keep = 0;
+    }
+    b->slots[seq].cached.resize(keep);
+    b->slots[seq].used = ++b->clock;
+    return (int)seq;
 }
 
 spore_llm_finish run(backend *b, const spore_llm_params *p, spore_llm_emit emit,
                      void *ectx, spore_llm_usage *usage) {
     std::string prompt;
     if (p->messages) {
-        if (!apply_template(b, p, prompt)) return SPORE_LLM_ERROR;
+        if (!apply_template(b, p, prompt))
+            return error(usage, SPORE_LLM_ERROR, "the model's chat template failed");
     } else {
         prompt = p->prompt;
     }
     std::vector<llama_token> toks;
-    if (!tokenize(b->vocab, prompt, true, toks)) return SPORE_LLM_ERROR;
+    if (!tokenize(b->vocab, prompt, true, toks))
+        return error(usage, SPORE_LLM_ERROR, "tokenization failed");
     const int n_ctx = (int)llama_n_ctx(b->ctx);
     const int n_prompt = (int)toks.size();
     usage->prompt_tokens = n_prompt;
-    if (n_prompt >= n_ctx) return SPORE_LLM_ERROR;
-
-    // Reuse the shared prefix. Always re-decode at least one prompt token:
-    // sampling needs the logits of the last one.
-    size_t keep = 0;
-    while (p->cache_prompt && keep < b->cached.size() && keep < toks.size() &&
-           b->cached[keep] == toks[keep])
-        keep++;
-    if (keep == toks.size()) keep--;
-    llama_memory_t mem = llama_get_memory(b->ctx);
-    if (!llama_memory_seq_rm(mem, 0, (llama_pos)keep, -1)) {
-        llama_memory_clear(mem, true); // recurrent/SWA caches: no partial removal
-        keep = 0;
+    if (n_prompt >= n_ctx) {
+        snprintf(usage->error, sizeof usage->error,
+                 "the prompt has %d tokens; the context holds %d", n_prompt, n_ctx);
+        return SPORE_LLM_INVALID;
     }
-    b->cached.resize(keep);
+
+    size_t keep;
+    const int seq = prepare_slot(b, toks, p->cache_prompt, keep);
+    std::vector<llama_token> &cached = b->slots[(size_t)seq].cached;
     usage->cached_tokens = (int)keep;
 
     // Batches of at most 256, polling between them (emit with no text), so
     // a cancel or barge-in need not wait for a long uncached prompt.
-    const int n_batch = std::min<int>((int)llama_n_batch(b->ctx), 256);
-    for (int i = (int)keep; i < n_prompt; i += n_batch) {
+    for (int i = (int)keep; i < n_prompt; i += b->n_batch) {
         if (i > (int)keep && emit(ectx, "", 0)) return SPORE_LLM_STOP;
-        int n = n_prompt - i < n_batch ? n_prompt - i : n_batch;
-        if (llama_decode(b->ctx, llama_batch_get_one(toks.data() + i, n)))
-            return fail(b);
-        b->cached.insert(b->cached.end(), toks.begin() + i, toks.begin() + i + n);
+        int n = n_prompt - i < b->n_batch ? n_prompt - i : b->n_batch;
+        if (int rc = decode(b, seq, toks.data() + i, n, i)) return fail(b, usage, rc);
+        cached.insert(cached.end(), toks.begin() + i, toks.begin() + i + n);
     }
 
     llama_sampler *smpl = make_sampler(p);
@@ -146,11 +219,11 @@ spore_llm_finish run(backend *b, const spore_llm_params *p, spore_llm_emit emit,
         }
         usage->completion_tokens = n_gen + 1;
         if (n > 0 && emit(ectx, piece.data(), (size_t)n)) break;
-        if (llama_decode(b->ctx, llama_batch_get_one(&tok, 1))) {
-            fin = fail(b);
+        if (int rc = decode(b, seq, &tok, 1, n_prompt + n_gen)) {
+            fin = fail(b, usage, rc);
             break;
         }
-        b->cached.push_back(tok);
+        cached.push_back(tok);
     }
     llama_sampler_free(smpl);
     return fin;
@@ -164,7 +237,7 @@ spore_llm_finish generate(void *self, const spore_llm_params *p,
     try {
         return run(b, p, emit, ectx, usage);
     } catch (...) {
-        return SPORE_LLM_ERROR;
+        return error(usage, SPORE_LLM_ERROR, "internal error");
     }
 }
 
@@ -224,6 +297,10 @@ extern "C" spore_llm_backend *spore_llama_new(const spore_llama_config *cfg) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t)cfg->n_ctx;
         if (cfg->n_threads > 0) cp.n_threads = cp.n_threads_batch = cfg->n_threads;
+        int n_slots = cfg->embedding ? 1 : cfg->n_slots > 0 ? cfg->n_slots : 1;
+        // Every slot may use the whole context, sharing cells for common prefixes.
+        cp.n_seq_max = (uint32_t)std::min(n_slots, 64);
+        cp.kv_unified = true;
         if (cfg->embedding) {
             cp.embeddings = true;
             // Non-causal models need the whole input in one micro-batch.
@@ -231,6 +308,9 @@ extern "C" spore_llm_backend *spore_llama_new(const spore_llama_config *cfg) {
         }
         b->ctx = llama_init_from_model(b->model, cp);
         if (!b->ctx) throw 0;
+        b->slots.resize(cp.n_seq_max);
+        b->n_batch = std::min<int>((int)llama_n_batch(b->ctx), 256);
+        b->batch = llama_batch_init(b->n_batch, 0, 1);
         if (cfg->embedding && llama_pooling_type(b->ctx) == LLAMA_POOLING_TYPE_NONE) {
             fprintf(stderr, "spore_llama: model has no pooling; cannot embed\n");
             throw 0;
@@ -255,6 +335,7 @@ extern "C" spore_llm_backend *spore_llama_new(const spore_llama_config *cfg) {
 extern "C" void spore_llama_free(spore_llm_backend *be) {
     if (!be) return;
     backend *b = static_cast<backend *>(be->self);
+    if (b->batch.token) llama_batch_free(b->batch);
     if (b->ctx) llama_free(b->ctx);
     if (b->model) llama_model_free(b->model);
     delete b;

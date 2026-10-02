@@ -15,6 +15,7 @@ typedef struct {
     int n_gpu_layers;       /* layers to offload; 0 = CPU only */
     int n_threads;          /* 0 = llama.cpp default */
     int embedding;          /* serve embeddings instead of completions */
+    int n_slots;            /* prompt-cache slots, at most 64; 0 = 1 */
 } spore_llama_config;
 
 /* Load the model. Returns NULL on failure. Calls are serialised

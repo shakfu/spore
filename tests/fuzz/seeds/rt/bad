@@ -1,0 +1,6 @@
+{
+[]
+{"type": 1}
+{"foo": "bar"}
+{"type": "nope"}
+{"type": "input_audio_buffer.append", "audio": "!!!"}

@@ -1,12 +1,16 @@
 /* Unit tests for the parser, JSON and helpers. */
+#define _POSIX_C_SOURCE 200809L
 #include "internal.h"
 #include "spore_json.h"
 
 #include <locale.h>
 #include <math.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 static int failures, checks;
 
@@ -76,28 +80,35 @@ static void test_tokens_and_hosts(void) {
     CHECK(!spore__has_token(S("closed"), "close"));
     CHECK(spore__has_token(S(" ,close ,"), "close"));
 
-    CHECK(spore__host_allowed(S("localhost")));
-    CHECK(spore__host_allowed(S("LOCALHOST:8080")));
-    CHECK(spore__host_allowed(S("127.0.0.1:1")));
-    CHECK(spore__host_allowed(S("[::1]:8080")));
-    CHECK(spore__host_allowed(S("app.localhost")));
-    CHECK(!spore__host_allowed(S(".localhost")));
-    CHECK(!spore__host_allowed(S("localhost.evil.com")));
-    CHECK(!spore__host_allowed(S("evil.com")));
-    CHECK(!spore__host_allowed(S("127.0.0.2")));
-    CHECK(!spore__host_allowed(S("localhost:80x")));
-    CHECK(!spore__host_allowed(S("[::1]x")));
-    CHECK(!spore__host_allowed(S("")));
+    CHECK(spore__host_allowed(S("localhost"), NULL));
+    CHECK(spore__host_allowed(S("LOCALHOST:8080"), NULL));
+    CHECK(spore__host_allowed(S("127.0.0.1:1"), NULL));
+    CHECK(spore__host_allowed(S("[::1]:8080"), NULL));
+    CHECK(spore__host_allowed(S("app.localhost"), NULL));
+    CHECK(!spore__host_allowed(S(".localhost"), NULL));
+    CHECK(!spore__host_allowed(S("localhost.evil.com"), NULL));
+    CHECK(!spore__host_allowed(S("evil.com"), NULL));
+    CHECK(!spore__host_allowed(S("127.0.0.2"), NULL));
+    CHECK(!spore__host_allowed(S("localhost:80x"), NULL));
+    CHECK(!spore__host_allowed(S("[::1]x"), NULL));
+    CHECK(!spore__host_allowed(S(""), NULL));
+    const char *hosts[] = {"", "spore.example.com", NULL};
+    CHECK(spore__host_allowed(S("Spore.Example.com"), hosts));
+    CHECK(spore__host_allowed(S("spore.example.com:443"), hosts));
+    CHECK(!spore__host_allowed(S("x.spore.example.com"), hosts));
+    CHECK(!spore__host_allowed(S(""), hosts));
 
     const char *extra[] = {"https://app.example", NULL};
-    CHECK(spore__origin_allowed(S("http://localhost:5173"), NULL));
-    CHECK(spore__origin_allowed(S("https://127.0.0.1"), NULL));
-    CHECK(spore__origin_allowed(S("https://app.example"), extra));
-    CHECK(!spore__origin_allowed(S("https://app.example.org"), extra));
-    CHECK(!spore__origin_allowed(S("null"), NULL));
-    CHECK(!spore__origin_allowed(S("http://evil.com"), NULL));
-    CHECK(!spore__origin_allowed(S("file://localhost"), NULL));
-    CHECK(!spore__origin_allowed(S("http://localhost/x"), NULL));
+    CHECK(spore__origin_allowed(S("http://localhost:5173"), NULL, 1));
+    CHECK(spore__origin_allowed(S("https://127.0.0.1"), NULL, 1));
+    CHECK(spore__origin_allowed(S("https://app.example"), extra, 1));
+    CHECK(!spore__origin_allowed(S("https://app.example.org"), extra, 1));
+    CHECK(!spore__origin_allowed(S("null"), NULL, 1));
+    CHECK(!spore__origin_allowed(S("http://evil.com"), NULL, 1));
+    CHECK(!spore__origin_allowed(S("file://localhost"), NULL, 1));
+    CHECK(!spore__origin_allowed(S("http://localhost/x"), NULL, 1));
+    CHECK(!spore__origin_allowed(S("http://localhost:5173"), extra, 0));
+    CHECK(spore__origin_allowed(S("https://app.example"), extra, 0));
 }
 
 static void test_url(void) {
@@ -263,8 +274,58 @@ static void test_rt_audio(void) {
 }
 #endif
 
+static void reply_ud(spore_req *req, spore_resp *resp, void *ud) {
+    (void)req;
+    spore_reply(resp, 200, "text/plain", ud, strlen(ud));
+}
+
+/* GET `path` on a fresh connection, running the loop on this thread.
+ * Returns the status, or -1. */
+static int get_status(spore_server *srv, const char *path) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET,
+                            .sin_port = htons(spore_port(srv)),
+                            .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    if (fd < 0 || connect(fd, (struct sockaddr *)&a, sizeof a) < 0) return -1;
+    char req[128], resp[256];
+    int n = snprintf(req, sizeof req,
+                     "GET %s HTTP/1.1\r\nHost: localhost\r\n"
+                     "Connection: close\r\n\r\n", path);
+    int status = -1;
+    if (send(fd, req, (size_t)n, 0) == n) {
+        for (int i = 0; i < 100; i++) {
+            spore_poll(srv, 10);
+            ssize_t k = recv(fd, resp, sizeof resp - 1, MSG_DONTWAIT);
+            if (k > 0) {
+                resp[k] = '\0';
+                status = atoi(resp + 9); /* "HTTP/1.1 NNN" */
+                break;
+            }
+        }
+    }
+    close(fd);
+    return status;
+}
+
+static void test_unroute(void) {
+    spore_server *srv = spore_new(&(spore_config){0});
+    CHECK(srv != NULL);
+    if (!srv) return;
+    char a[] = "a", b[] = "b";
+    CHECK(spore_route(srv, "GET", "/a", reply_ud, a) == 0);
+    CHECK(spore_route(srv, "GET", "/b", reply_ud, b) == 0);
+    CHECK(spore_route(srv, "GET", "/c", reply_ud, a) == 0);
+    CHECK(get_status(srv, "/a") == 200);
+    spore__unroute(srv, a);
+    CHECK(get_status(srv, "/a") == 404);
+    CHECK(get_status(srv, "/b") == 200);
+    CHECK(get_status(srv, "/c") == 404);
+    spore_free(srv);
+}
+
 int main(void) {
     test_parse_head();
+    test_unroute();
     test_tokens_and_hosts();
     test_url();
     test_json_read();

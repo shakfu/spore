@@ -44,8 +44,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         REQUIRE(inside(hd->value, lo, hi));
         REQUIRE(!memchr(hd->value.ptr, '\r', hd->value.len) &&
                 !memchr(hd->value.ptr, '\n', hd->value.len));
-        spore__host_allowed(hd->value);
-        spore__origin_allowed(hd->value, NULL);
+        spore__host_allowed(hd->value, NULL);
+        spore__origin_allowed(hd->value, NULL, 1);
         spore__has_token(hd->value, "close");
     }
     char out[512];

@@ -336,6 +336,8 @@ spore_ws *spore__ws_detached(const spore_ws_config *cfg, void *ud) {
     return ws;
 }
 
+spore_resp *spore__ws_resp(spore_ws *ws) { return ws->resp; }
+
 long spore__ws_feed(spore_ws *ws, char *data, size_t len) {
     return feed(ws, data, len);
 }

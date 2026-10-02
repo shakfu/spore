@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Per target, four targets: 10 min nightly, 2 min per push.
+      FUZZ_TIME: ${{ github.event_name == 'schedule' && 600 || 120 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: build-fuzz/corpus-*
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - run: make fuzz-run FUZZ_CC=clang
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build-fuzz/corpus-*
+          key: fuzz-corpus-${{ github.run_id }}
+      - name: Upload reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            build-fuzz/crash-*
+            build-fuzz/leak-*
+            build-fuzz/oom-*
+            build-fuzz/timeout-*
+          if-no-files-found: ignore
+
+  autobahn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: make autobahn MODULES=ws
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-report
+          path: build/autobahn
+          if-no-files-found: ignore

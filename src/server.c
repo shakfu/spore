@@ -47,6 +47,7 @@ struct spore_resp {
     int minor;
     int keep_alive;
     int chunked;
+    size_t max_pending; /* 0: unbounded */
     spore_buf hdrs; /* extra header lines, CRLF-terminated */
     spore_buf out;  /* bytes queued for the socket */
     size_t off;     /* bytes of `out` already sent */
@@ -62,6 +63,7 @@ typedef struct {
     const char *base;  /* `in` when the head was parsed */
     spore_req req;
     int draining;      /* write side shut, discarding input until EOF */
+    int eof;           /* peer shut its write side: no more input */
     int64_t t_start;   /* first byte of the pending request, 0 if none */
     int64_t t_active;  /* last I/O */
     spore_resp *resp;
@@ -262,9 +264,20 @@ int spore_begin(spore_resp *r, int status, const char *ctype) {
     return ok ? 0 : -1;
 }
 
+/* Caller holds r->mu. A client that stops reading must not make `out`
+ * grow without bound: past the cap, treat it as gone. */
+static int overflow(spore_resp *r, size_t add) {
+    if (!r->max_pending || r->out.len - r->off + add <= r->max_pending)
+        return 0;
+    r->closed = 1;
+    if (r->srv) wake(r->srv);
+    return 1;
+}
+
 int spore_write(spore_resp *r, const void *data, size_t len) {
     pthread_mutex_lock(&r->mu);
-    int ok = r->state == RS_STREAM && !r->closed && !r->out.err;
+    int ok = r->state == RS_STREAM && !r->closed && !r->out.err &&
+             !overflow(r, r->head_only ? 0 : len);
     if (ok && len && !r->head_only) {
         if (r->chunked) spore_buf_printf(&r->out, "%zx\r\n", len);
         spore_buf_add(&r->out, data, len);
@@ -312,7 +325,8 @@ int spore_end(spore_resp *r) {
 int spore__write2(spore_resp *r, const void *a, size_t alen, const void *b,
                   size_t blen, int end) {
     pthread_mutex_lock(&r->mu);
-    int ok = r->state == RS_STREAM && !r->closed && !r->out.err;
+    int ok = r->state == RS_STREAM && !r->closed && !r->out.err &&
+             !overflow(r, r->head_only ? 0 : alen + blen);
     if (ok && !r->head_only) {
         if (r->chunked) spore_buf_printf(&r->out, "%zx\r\n", alen + blen);
         spore_buf_add(&r->out, a, alen);
@@ -335,6 +349,14 @@ size_t spore__pending(spore_resp *r) {
     return n;
 }
 
+void spore__resp_take(spore_resp *r, spore_buf *dst) {
+    pthread_mutex_lock(&r->mu);
+    if (r->out.len > r->off)
+        spore_buf_add(dst, r->out.ptr + r->off, r->out.len - r->off);
+    r->off = r->out.len = 0;
+    pthread_mutex_unlock(&r->mu);
+}
+
 int spore_closed(spore_resp *r) {
     pthread_mutex_lock(&r->mu);
     int c = r->closed;
@@ -351,9 +373,11 @@ static spore_resp *resp_new(spore_server *s, const spore_req *req, int keep) {
     r->minor = req ? req->minor : 1;
     r->head_only = req && spore_str_eq(req->method, "HEAD");
     r->keep_alive = keep;
+    r->max_pending = s ? s->cfg.max_pending : 0;
     if (req) {
         spore_str o = spore_header_get(req, "Origin");
-        if (o.ptr && spore__origin_allowed(o, s->cfg.origins))
+        if (o.ptr && spore__origin_allowed(o, s->cfg.origins,
+                                           !s->cfg.origins_only))
             spore_buf_printf(&r->hdrs,
                              "Access-Control-Allow-Origin: %.*s\r\n"
                              "Vary: Origin\r\n",
@@ -467,7 +491,7 @@ static int protocol_token(spore_str list, const char *tok, size_t tl) {
 /* Access policy and framing. Returns 0 to dispatch, 1 if a reply was
  * queued, or an error status to send before closing. */
 static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
-    int tcp = !s->unix_path;
+    int check_host = !s->unix_path || s->cfg.hosts;
     spore_str host = {0}, origin = {0}, cl = {0};
     int n_host = 0, n_cl = 0;
     for (size_t i = 0; i < req->n_headers; i++) {
@@ -479,8 +503,10 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
     }
     if (n_host > 1 || (req->minor >= 1 && n_host == 0)) return 400;
     /* DNS rebinding: a hostile page reaches loopback under its own name. */
-    if (tcp && n_host && !spore__host_allowed(host)) return 403;
-    if (origin.ptr && !spore__origin_allowed(origin, s->cfg.origins))
+    if (check_host && n_host && !spore__host_allowed(host, s->cfg.hosts))
+        return 403;
+    if (origin.ptr && !spore__origin_allowed(origin, s->cfg.origins,
+                                             !s->cfg.origins_only))
         return 403;
 
     if (n_cl > 1) return 400;
@@ -594,7 +620,7 @@ static int flush(conn *c, int64_t now) {
         r->out.len -= r->off;
         r->off = 0;
     }
-    if (r->out.err) rc = -1;
+    if (r->out.err || r->closed) rc = -1; /* closed: overflow() */
     if (!rc && r->state == RS_DONE && !r->out.len) rc = 1;
     pthread_mutex_unlock(&r->mu);
     return rc;
@@ -640,7 +666,11 @@ static int conn_read(spore_server *s, conn *c, int64_t now) {
             c->t_active = now;
             continue;
         }
-        if (n == 0) return -1;
+        if (n == 0) { /* half-close: answer what was sent, then close */
+            if (c->up.on_data) return -1;
+            c->eof = 1;
+            return 0;
+        }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return -1;
@@ -668,7 +698,10 @@ static int serve_upgraded(conn *c, int64_t now) {
 
 static int conn_service(spore_server *s, conn *c, int64_t now) {
     for (;;) {
-        if (c->up.on_data && c->resp) return serve_upgraded(c, now);
+        if (c->up.on_data && c->resp) {
+            int rc = serve_upgraded(c, now);
+            return c->eof ? -1 : rc;
+        }
         if (c->resp) {
             int rc = flush(c, now);
             if (rc < 0) return -1;
@@ -687,7 +720,7 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
             continue;
         }
         if (c->draining)
-            return now - c->t_active > DRAIN_MS ? -1 : 0;
+            return c->eof || now - c->t_active > DRAIN_MS ? -1 : 0;
 
         spore_req *req = &c->req;
         if (!c->head_len) {
@@ -741,6 +774,7 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
         c->scan = 0;
     }
     if (!c->resp && !c->draining) {
+        if (c->eof) return -1; /* no further request can arrive */
         if (c->t_start && now - c->t_start > s->cfg.request_ms) {
             if (simple_reply(s, c, NULL, 408, 0, NULL) < 0) return -1;
             return conn_service(s, c, now);
@@ -808,21 +842,36 @@ static void accept_all(spore_server *s, int64_t now) {
     }
 }
 
+/* When conn_service() would next act on a timeout, or INT64_MAX. */
+static int64_t deadline(spore_server *s, conn *c) {
+    if (c->draining) return c->t_active + DRAIN_MS + 1;
+    if (c->resp) return INT64_MAX;
+    if (c->t_start) return c->t_start + s->cfg.request_ms + 1;
+    return c->t_active + s->cfg.idle_ms + 1;
+}
+
 int spore_poll(spore_server *s, int timeout_ms) {
     tl_loop = s;
     size_t n = 2;
+    int64_t next = INT64_MAX;
     s->pfds[0] = (struct pollfd){s->wake[0], POLLIN, 0};
     s->pfds[1] = (struct pollfd){s->n_conns < s->cfg.max_conns ? s->lfd : -1,
                                  POLLIN, 0};
     for (size_t i = 0; i < s->n_conns; i++) {
         conn *c = s->conns[i];
         short ev = 0;
-        if (c->in_len < c->in_cap || c->in_cap < in_limit(s, c)) ev |= POLLIN;
+        if (!c->eof && (c->in_len < c->in_cap || c->in_cap < in_limit(s, c)))
+            ev |= POLLIN;
         if (want_write(c)) ev |= POLLOUT;
         s->pfds[n++] = (struct pollfd){c->fd, ev, 0};
+        int64_t d = deadline(s, c);
+        if (d < next) next = d;
     }
-    /* Timeouts are checked once per wake-up; 1 s bounds their lateness. */
-    if (s->n_conns && (timeout_ms < 0 || timeout_ms > 1000)) timeout_ms = 1000;
+    if (next != INT64_MAX) {
+        int64_t wait = next - now_ms();
+        if (wait < 0) wait = 0;
+        if (timeout_ms < 0 || wait < timeout_ms) timeout_ms = (int)wait;
+    }
     if (poll(s->pfds, n, timeout_ms) < 0 && errno != EINTR) {
         tl_loop = NULL;
         return -1;
@@ -839,7 +888,12 @@ int spore_poll(spore_server *s, int timeout_ms) {
     for (size_t i = s->n_conns; i-- > 0;) {
         conn *c = s->conns[i];
         short re = s->pfds[2 + i].revents;
-        if ((re & (POLLIN | POLLHUP | POLLERR)) && conn_read(s, c, now) < 0) {
+        /* POLLHUP: the peer cannot receive (POSIX), so stop even with input
+         * unread, as when the buffer is full. A draining connection still
+         * reads to EOF: closing with unread input sends RST, which can
+         * destroy the reply the peer has not yet read. */
+        if ((re & POLLERR) || ((re & POLLHUP) && !c->draining) ||
+            ((re & (POLLIN | POLLHUP)) && conn_read(s, c, now) < 0)) {
             conn_close(s, i);
             continue;
         }
@@ -886,6 +940,19 @@ int spore_route(spore_server *s, const char *method, const char *pattern,
     r->ud = ud;
     s->n_routes++;
     return 0;
+}
+
+void spore__unroute(spore_server *s, void *ud) {
+    size_t n = 0;
+    for (size_t i = 0; i < s->n_routes; i++) {
+        if (s->routes[i].ud == ud) {
+            free(s->routes[i].method);
+            free(s->routes[i].pattern);
+        } else {
+            s->routes[n++] = s->routes[i];
+        }
+    }
+    s->n_routes = n;
 }
 
 static int listen_tcp(spore_server *s) {
@@ -959,6 +1026,7 @@ spore_server *spore_new(const spore_config *cfg) {
     if (!c->max_body) c->max_body = 8u << 20;
     if (!c->idle_ms) c->idle_ms = 30000;
     if (!c->request_ms) c->request_ms = 30000;
+    if (!c->max_pending) c->max_pending = 16u << 20;
     if ((c->token && !(s->token = strdup(c->token))) ||
         (c->unix_path && !(s->unix_path = strdup(c->unix_path))))
         goto fail;

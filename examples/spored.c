@@ -24,12 +24,14 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static spore_server *g_srv;
 
@@ -302,6 +304,25 @@ static void on_ws_stream(spore_req *req, spore_resp *resp, void *ud) {
 }
 #endif /* SPORE_WITH_WS */
 
+/* Generate a token (32 random bytes, hex) into `out` and write it to `path`
+ * with mode 0600. The file is created beside `path` and renamed over it,
+ * so an existing file's mode or open descriptors never see the token. */
+static int write_token_file(const char *path, char out[65]) {
+    unsigned char r[32];
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd < 0 ? -1 : read(fd, r, sizeof r);
+    if (fd >= 0) close(fd);
+    if (n != (ssize_t)sizeof r) return -1;
+    for (size_t i = 0; i < sizeof r; i++) snprintf(out + 2 * i, 3, "%02x", r[i]);
+    char tmp[4096];
+    if (snprintf(tmp, sizeof tmp, "%s.XXXXXX", path) >= (int)sizeof tmp) return -1;
+    if ((fd = mkstemp(tmp)) < 0) return -1; /* mode 0600 */
+    int ok = write(fd, out, 64) == 64 && write(fd, "\n", 1) == 1;
+    ok = close(fd) == 0 && ok && rename(tmp, path) == 0;
+    if (!ok) unlink(tmp);
+    return ok ? 0 : -1;
+}
+
 #ifndef SPORE_WITH_LLM
 static void on_health(spore_req *req, spore_resp *resp, void *ud) {
     (void)req;
@@ -328,8 +349,11 @@ static void usage(void) {
             "  --port N        loopback TCP port (default 8080, 0 = any)\n"
             "  --ipv6          bind ::1 instead of 127.0.0.1\n"
             "  --unix PATH     bind a Unix socket instead of TCP\n"
-            "  --token T       require 'Authorization: Bearer T'\n"
+            "  --token T       require 'Authorization: Bearer T'; other users see T in ps\n"
+            "  --token-file F  generate a token, write it to F (mode 0600), print a URL with it\n"
             "  --origin O      also allow this Origin (repeatable)\n"
+            "  --origins-only  allow only --origin values, not loopback origins\n"
+            "  --host H        also allow this Host name (repeatable); checked on --unix too\n"
             "  --static DIR    serve DIR at /\n"
 #ifdef SPORE_WITH_LLM
             "  --workers N     concurrent backend calls (default 1)\n"
@@ -346,6 +370,7 @@ static void usage(void) {
             "  --ctx N         context size (default 4096; the model's own with --embedding)\n"
             "  --gpu-layers N  layers to offload (default 0)\n"
             "  --embedding     serve /v1/embeddings instead of completions\n"
+            "  --slots N       prompt-cache slots for interleaved conversations (default 4)\n"
 #endif
 #ifdef SPORE_WITH_WHISPER
             "  --asr PATH      whisper.cpp model for /v1/realtime speech input\n"
@@ -369,10 +394,13 @@ int main(int argc, char **argv) {
 #ifdef SPORE_WITH_LLM
     spore_llm_config lcfg = {0};
 #endif
-    const char *static_dir = NULL, *origins[16] = {0};
+    const char *static_dir = NULL, *origins[16] = {0}, *hosts[16] = {0};
+    const char *token_file = NULL;
+    size_t n_hosts = 0;
+    char token[65];
     size_t n_origins = 0;
 #ifdef SPORE_WITH_LLAMA
-    spore_llama_config mcfg = {.n_ctx = -1};
+    spore_llama_config mcfg = {.n_ctx = -1, .n_slots = 4};
 #endif
 #if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
     int gpu = 0;
@@ -391,7 +419,10 @@ int main(int argc, char **argv) {
         else if (strcmp(a, "--ipv6") == 0) cfg.ipv6 = 1;
         else if (ARG("--unix")) cfg.unix_path = v;
         else if (ARG("--token")) cfg.token = v;
+        else if (ARG("--token-file")) token_file = v;
         else if (ARG("--origin") && n_origins < 15) origins[n_origins++] = v;
+        else if (strcmp(a, "--origins-only") == 0) cfg.origins_only = 1;
+        else if (ARG("--host") && n_hosts < 15) hosts[n_hosts++] = v;
         else if (ARG("--static")) static_dir = v;
 #ifdef SPORE_WITH_LLM
         else if (ARG("--workers")) lcfg.workers = (size_t)atoi(v);
@@ -411,6 +442,7 @@ int main(int argc, char **argv) {
         else if (ARG("--ctx")) mcfg.n_ctx = atoi(v);
         else if (ARG("--gpu-layers")) mcfg.n_gpu_layers = atoi(v);
         else if (strcmp(a, "--embedding") == 0) mcfg.embedding = 1;
+        else if (ARG("--slots")) mcfg.n_slots = atoi(v);
 #endif
 #ifdef SPORE_WITH_WHISPER
         else if (ARG("--asr")) wcfg.model_path = v;
@@ -426,6 +458,15 @@ int main(int argc, char **argv) {
 #undef ARG
     }
     cfg.origins = origins;
+    if (n_hosts) cfg.hosts = hosts;
+    if (token_file) {
+        if (cfg.token) usage(); /* one or the other */
+        if (write_token_file(token_file, token)) {
+            fprintf(stderr, "spored: cannot write %s: %s\n", token_file, strerror(errno));
+            return 1;
+        }
+        cfg.token = token;
+    }
 #ifdef SPORE_WITH_LLAMA
     if (mcfg.n_ctx < 0) mcfg.n_ctx = mcfg.embedding ? 0 : 4096;
     if (gpu && !mcfg.n_gpu_layers) mcfg.n_gpu_layers = 999; /* all layers */
@@ -514,6 +555,10 @@ int main(int argc, char **argv) {
     else
         printf("spored listening on http://%s:%u\n",
                cfg.ipv6 ? "[::1]" : "127.0.0.1", spore_port(g_srv));
+    /* The fragment never reaches a server, a log or a Referer. */
+    if (token_file && !cfg.unix_path)
+        printf("open http://%s:%u/#token=%s\n", cfg.ipv6 ? "[::1]" : "localhost",
+               spore_port(g_srv), token);
     fflush(stdout);
 
     int rc = spore_run(g_srv);

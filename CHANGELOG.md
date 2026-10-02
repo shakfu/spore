@@ -52,8 +52,36 @@ Initial release.
 
 - Prompt evaluation in `spore_llama` and `spore_outetts` runs in batches and polls for cancellation between them. An emit with no data now polls in both backend interfaces. A cancel during an OuteTTS prompt waited 0.64 s on CPU and now takes 0.25 s. This was found through an intermittent test failure.
 
+- Prompt-cache slots in `backends/llama` (`n_slots`, default 1; `spored --slots`, default 4). Each slot is a llama.cpp sequence in one unified KV buffer, so interleaved conversations keep their caches, and a shared system prompt is copied between slots without new cells. Separate per-slot buffers were rejected: they divide `n_ctx` between slots. The cost is attention over every slot's cells: 14% slower generation with three 2k-token slots filled (Qwen3-0.6B, CPU). The library defaults to 1 so an embedder serving one client does not pay that cost.
+
+- `spore_config.max_pending` (16 MiB): a streamed write or WebSocket send that would queue more unsent output fails and closes the connection. Before, a client that stopped reading let the buffer grow until generation ended. Closing over blocking keeps workers from stalling on a client that never reads.
+
+- `spored --token-file PATH` writes a generated token with mode `0600` and prints a URL with the token in the fragment. `--token T` is kept and documented as visible in `ps`. The README now states which transport suits which client, that a forwarder exposes the loopback listener, and an nginx reverse-proxy setup.
+
+- `fuzz_rt`: realtime client events against a detached session, with queued transcriptions and responses run inline on a stub backend. Every server event must be a JSON object with a string `type` and `event_id`.
+
+- CI (`.github/workflows/ci.yml`): `make fuzz-run` on every push (120 s per target) and nightly (600 s), with the corpus kept in the Actions cache; and `make autobahn`, the Autobahn testsuite against `/ws/echo` in Docker.
+
+- `spore_config.hosts`: extra allowed `Host` names. When set, the Host check also runs on a Unix socket. A reverse proxy can now pass `Host` unchanged and keep spore's DNS-rebinding check, instead of validating and rewriting it itself. `spore_config.origins_only` drops the implicit loopback origins. `spored --host`, `--origins-only`.
+
+- Half-close: EOF from a client ends input but no longer cancels its responses. Buffered requests are answered, then the connection closes. The cost: a TCP client that closes is now noticed only when a write fails, so a non-streaming reply runs to the end. TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing.
+
+- Backend errors carry a message: `spore_llm_usage.error`, and a new finish value `SPORE_LLM_INVALID` that maps to 400. The SSE head now waits for the first event, so a streamed request can get the 400 too. The llama backend reports a prompt longer than the context as a 400 that names both lengths.
+
+- A leading `<think>` block in a chat reply goes to `reasoning_content`, streamed or not, as in llama-server. `"reasoning_format": "none"` keeps the raw text.
+
+- `spore_poll()` waits until the nearest connection deadline instead of waking every second, so timeouts fire on time.
+
+- `POST /v1/audio/speech` in the realtime module when a TTS stage is configured: WAV (whole) or raw PCM (streamed), at most 4 concurrent requests.
+
 ### Fixed before release
 
 - Lost wake-up in the event loop. The loop cleared `wake_pending` before draining the wake pipe. A worker byte written between the two was drained, but the flag stayed set, so no later worker wrote again. Every cross-thread reply then waited for the 1 s poll cap. `test_no_lost_wakeups_under_streaming` measures the stall.
+
+- `spore_llm_new()` could leave routes pointing at its freed handle when a later `spore_route()` failed. It now starts its workers first and removes its own routes on failure.
+
+- `POLLHUP` on a connection whose input buffer was full went unhandled: the loop read only when it had room, so it spun on the event until the response ended. `POLLHUP` now closes the connection, except while draining.
+
+- Non-streaming LLM requests were not cancelled when the client disconnected. Only a failed write stopped generation, and a non-streaming reply writes nothing until the end.
 
 - An absent query string was `{NULL, 0}`, so `spore_query_get()` computed `NULL + 0` (undefined behaviour). It is now an empty span at the end of the target. Found by `fuzz_http` under UBSan.

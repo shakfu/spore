@@ -1,0 +1,2 @@
+{"type": "session.update", "session": {"type": "realtime", "instructions": "be brief", "output_modalities": ["text"], "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}, "turn_detection": {"type": "server_vad", "threshold": 0.3, "prefix_padding_ms": 100, "silence_duration_ms": 200}, "transcription": {"model": "whisper-1"}}, "output": {"voice": "marin"}}}}
+{"type": "response.create", "response": {"instructions": "x", "max_output_tokens": 3}}

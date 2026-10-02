@@ -25,6 +25,8 @@
 #define FRAME (RATE / 100)         /* VAD frame: 10 ms */
 #define MS(samples) ((long)((samples) / (RATE / 1000)))
 #define MAX_EVENT (16u << 20)      /* OpenAI caps an append at 15 MiB */
+#define SPEECH_MAX_INPUT 4096      /* bytes; OpenAI allows 4096 characters */
+#define SPEECH_MAX_JOBS 4          /* concurrent /v1/audio/speech requests */
 
 enum { ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT };
 enum { C_INPUT_TEXT, C_INPUT_AUDIO, C_OUTPUT_TEXT, C_OUTPUT_AUDIO };
@@ -84,10 +86,11 @@ struct spore_rt {
     size_t max_input;     /* samples */
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    int live;             /* sessions not yet freed */
+    int live;             /* sessions and speech jobs not yet freed */
+    int speaking;         /* speech jobs running */
 };
 
-typedef struct {
+typedef struct spore__rt_sess {
     spore_rt *rt;
     spore_ws *ws;
     pthread_mutex_t mu;
@@ -1114,8 +1117,14 @@ static void response_json(spore_buf *b, session *s, response *r,
     } else {
         spore_buf_printf(b, "{\"type\":\"%s\"", detail_type);
         if (reason) spore_buf_printf(b, ",\"reason\":\"%s\"", reason);
-        if (!strcmp(detail_type, "failed"))
-            spore_buf_puts(b, ",\"error\":{\"type\":\"server_error\",\"code\":\"generation_failed\"}");
+        if (!strcmp(detail_type, "failed")) {
+            spore_buf_puts(b, ",\"error\":{\"type\":\"server_error\",\"code\":\"generation_failed\"");
+            if (u && u->error[0]) {
+                spore_buf_puts(b, ",\"message\":");
+                spore_json_str(b, u->error, strlen(u->error));
+            }
+            spore_buf_puts(b, "}");
+        }
         spore_buf_puts(b, "}");
     }
     spore_buf_puts(b, ",\"output\":[");
@@ -1196,7 +1205,7 @@ static spore_llm_msg *build_messages(session *s, response *r, size_t *n,
 static void run_response(session *s, response *r) {
     const spore_rt_backend *be = &s->rt->be;
     gen g = {s, r, NULL, {0}, 0, 0, {0}, NULL, 0};
-    spore_llm_usage usage = {0, 0, 0};
+    spore_llm_usage usage = {0};
     spore_llm_msg *msgs = NULL;
     char *strings = NULL;
     size_t n_msgs = 0;
@@ -1243,6 +1252,7 @@ static void run_response(session *s, response *r) {
                               .min_p = 0.05, .seed = SPORE_LLM_SEED_RANDOM,
                               .cache_prompt = 1};
         fin = be->llm.generate(be->llm.self, &p, emit_text, &g, &usage);
+        usage.error[sizeof usage.error - 1] = '\0';
         if (r->audio && !stopped(&g) && g.spoken < g.text.len)
             speak(&g, g.spoken, g.text.len);
         if (!r->audio && !stopped(&g) && g.sent < g.text.len) {
@@ -1262,7 +1272,8 @@ static void run_response(session *s, response *r) {
     if (cancelled) {
         status = dtype = "cancelled";
         reason = r->reason ? r->reason : "client_cancelled";
-    } else if (!g.it || fin == SPORE_LLM_ERROR || g.failed || g.text.err) {
+    } else if (!g.it || fin == SPORE_LLM_ERROR || fin == SPORE_LLM_INVALID ||
+               g.failed || g.text.err) {
         status = dtype = "failed";
     } else if (fin == SPORE_LLM_LENGTH) {
         status = dtype = "incomplete";
@@ -1347,14 +1358,14 @@ static void session_unref(session *s) {
     pthread_mutex_unlock(&rt->mu);
 }
 
-static void *worker(void *arg) {
-    session *s = arg;
+/* Run queued jobs until none is left (wait == 0) or the session closes. */
+static void run_jobs(session *s, int wait) {
     for (;;) {
         pthread_mutex_lock(&s->mu);
-        while (!s->head && !s->closed) pthread_cond_wait(&s->cv, &s->mu);
-        if (s->closed) {
+        while (wait && !s->head && !s->closed) pthread_cond_wait(&s->cv, &s->mu);
+        if (s->closed || !s->head) {
             pthread_mutex_unlock(&s->mu);
-            break;
+            return;
         }
         job *j = s->head;
         s->head = j->next;
@@ -1364,6 +1375,11 @@ static void *worker(void *arg) {
         else run_response(s, j->r);
         job_free(j);
     }
+}
+
+static void *worker(void *arg) {
+    session *s = arg;
+    run_jobs(s, 1);
     spore_ws_release(s->ws);
     session_unref(s);
     return NULL;
@@ -1381,14 +1397,11 @@ static void on_close(spore_ws *ws, int code, void *ud) {
     session_unref(s);
 }
 
-static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
-    spore_rt *rt = ud;
+/* A session with two references (loop and worker) and no connection.
+ * Returns NULL on allocation failure. */
+static session *session_new(spore_rt *rt, const char *model) {
     session *s = calloc(1, sizeof *s);
-    if (!s) {
-        spore_reply(resp, 500, "text/plain", "oom\n", 4);
-        return;
-    }
-    char model[128];
+    if (!s) return NULL;
     s->rt = rt;
     s->refs = 2;
     pthread_mutex_init(&s->mu, NULL);
@@ -1396,8 +1409,7 @@ static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
     id_into(s->id, "sess");
     id_into(s->conv_id, "conv");
     s->expires = (long)time(NULL) + 3600;
-    s->model = dup0(spore_query_get(req, "model", model, sizeof model) > 0
-                        ? model : rt->be.llm.model);
+    s->model = dup0(model ? model : rt->be.llm.model);
     config *c = &s->cfg;
     c->instructions = dup0(rt->instructions);
     c->voice = dup0(rt->voice);
@@ -1415,12 +1427,26 @@ static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
     if (!s->model || !c->instructions || !c->voice) {
         s->refs = 1;
         session_unref(s);
+        return NULL;
+    }
+    return s;
+}
+
+static const spore_ws_config ws_config = {.on_message = on_message,
+                                          .on_close = on_close,
+                                          .max_message = MAX_EVENT,
+                                          .protocol = "realtime"};
+
+static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
+    char model[128];
+    session *s = session_new(ud, spore_query_get(req, "model", model,
+                                                 sizeof model) > 0
+                                     ? model : NULL);
+    if (!s) {
         spore_reply(resp, 500, "text/plain", "oom\n", 4);
         return;
     }
-    spore_ws_config wc = {.on_message = on_message, .on_close = on_close,
-                          .max_message = MAX_EVENT, .protocol = "realtime"};
-    if (!(s->ws = spore_ws_accept(req, resp, &wc, s))) {
+    if (!(s->ws = spore_ws_accept(req, resp, &ws_config, s))) {
         s->refs = 1;
         session_unref(s);
         return;
@@ -1437,8 +1463,8 @@ static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
     pthread_mutex_unlock(&s->mu);
 }
 
-spore_rt *spore_rt_new(spore_server *srv, const spore_rt_backend *be,
-                       const spore_rt_config *cfg) {
+spore_rt *spore__rt_detached(const spore_rt_backend *be,
+                             const spore_rt_config *cfg) {
     if (!be->llm.generate || (be->asr.fn && be->asr.rate <= 0) ||
         (be->tts.fn && be->tts.rate <= 0))
         return NULL;
@@ -1450,12 +1476,244 @@ spore_rt *spore_rt_new(spore_server *srv, const spore_rt_backend *be,
     rt->max_input = (size_t)(cfg && cfg->max_input_s > 0 ? cfg->max_input_s : 600) * RATE;
     pthread_mutex_init(&rt->mu, NULL);
     pthread_cond_init(&rt->cv, NULL);
-    if (!rt->instructions || !rt->voice ||
-        spore_route(srv, "GET", "/v1/realtime", on_realtime, rt)) {
+    if (!rt->instructions || !rt->voice) {
         spore_rt_free(rt);
         return NULL;
     }
     return rt;
+}
+
+/* ---- POST /v1/audio/speech ------------------------------------------------ */
+
+typedef struct {
+    spore_rt *rt;
+    spore_resp *resp;
+    char *text, *voice;
+    int wav;              /* else raw PCM, streamed as it is produced */
+    int begun, dead;
+    float *pcm;           /* wav: every sample at tts.rate */
+    size_t n, cap;
+} speech;
+
+static void speech_error(spore_resp *resp, int status, const char *msg) {
+    spore_buf b = {0};
+    spore_buf_puts(&b, "{\"error\":{\"message\":");
+    spore_json_str(&b, msg, strlen(msg));
+    spore_buf_printf(&b, ",\"type\":\"%s\",\"code\":%d}}",
+                     status < 500 ? "invalid_request_error" : "server_error", status);
+    if (b.err) spore_reply(resp, 500, "text/plain", "oom\n", 4);
+    else spore_reply(resp, status, "application/json", b.ptr, b.len);
+    spore_buf_free(&b);
+}
+
+static int speech_emit(void *vsp, const float *pcm, size_t n) {
+    speech *sp = vsp;
+    if (sp->dead || spore_closed(sp->resp)) return 1;
+    if (!n) return 0; /* cancellation poll */
+    if (sp->wav) {
+        if (sp->n + n > sp->cap) {
+            size_t cap = (sp->n + n) * 2;
+            float *p = realloc(sp->pcm, cap * sizeof *p);
+            if (!p) return sp->dead = 1;
+            sp->pcm = p;
+            sp->cap = cap;
+        }
+        memcpy(sp->pcm + sp->n, pcm, n * sizeof *pcm);
+        sp->n += n;
+        return 0;
+    }
+    size_t m = 0;
+    float *r = spore__resample(pcm, n, sp->rt->be.tts.rate, RATE, &m);
+    unsigned char *raw = r ? malloc(m * 2 + 1) : NULL;
+    if (raw) spore__float_to_pcm16le(r, m, raw);
+    free(r);
+    if (raw && !sp->begun) {
+        sp->begun = 1;
+        if (spore_begin(sp->resp, 200, "audio/pcm")) sp->dead = 1;
+    }
+    if (!raw || sp->dead || spore_write(sp->resp, raw, m * 2)) sp->dead = 1;
+    free(raw);
+    return sp->dead;
+}
+
+static void put_le(unsigned char *p, uint32_t v, int bytes) {
+    for (int i = 0; i < bytes; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+/* 16-bit mono WAV at RATE from float samples at `rate`. */
+static int wav_reply(spore_resp *resp, const float *pcm, size_t n, int rate) {
+    size_t m = 0;
+    float *r = spore__resample(pcm ? pcm : (const float[1]){0}, n, rate, RATE, &m);
+    unsigned char *w = r && m <= (0xFFFFFFFFu - 44) / 2 ? malloc(44 + m * 2) : NULL;
+    if (!w) {
+        free(r);
+        return -1;
+    }
+    uint32_t data = (uint32_t)(m * 2);
+    memcpy(w, "RIFF", 4);
+    put_le(w + 4, 36 + data, 4);
+    memcpy(w + 8, "WAVEfmt ", 8);
+    put_le(w + 16, 16, 4);        /* fmt chunk size */
+    put_le(w + 20, 1, 2);         /* PCM */
+    put_le(w + 22, 1, 2);         /* mono */
+    put_le(w + 24, RATE, 4);
+    put_le(w + 28, RATE * 2, 4);  /* byte rate */
+    put_le(w + 32, 2, 2);         /* block align */
+    put_le(w + 34, 16, 2);        /* bits per sample */
+    memcpy(w + 36, "data", 4);
+    put_le(w + 40, data, 4);
+    spore__float_to_pcm16le(r, m, w + 44);
+    free(r);
+    spore_reply(resp, 200, "audio/wav", w, 44 + (size_t)data);
+    free(w);
+    return 0;
+}
+
+static void *speech_thread(void *arg) {
+    speech *sp = arg;
+    const spore_rt_tts *tts = &sp->rt->be.tts;
+    size_t len = strlen(sp->text), from = 0;
+    int failed = 0;
+    while (from < len && !sp->dead && !failed) {
+        size_t e = sentence_end(sp->text, from, len);
+        if (e <= from) e = len;
+        size_t i = from;
+        while (i < e && (sp->text[i] == ' ' || sp->text[i] == '\n')) i++;
+        if (i < e && tts->fn(tts->self, sp->text + i, e - i, sp->voice,
+                             speech_emit, sp) && !sp->dead)
+            failed = 1;
+        from = e;
+    }
+    if (sp->begun || spore_closed(sp->resp)) {
+        spore_end(sp->resp); /* a failure mid-stream can only truncate */
+    } else if (failed || sp->dead) {
+        speech_error(sp->resp, 500, "speech synthesis failed");
+    } else if (sp->wav) {
+        if (wav_reply(sp->resp, sp->pcm, sp->n, tts->rate))
+            speech_error(sp->resp, 500, "out of memory");
+    } else {
+        spore_reply(sp->resp, 200, "audio/pcm", "", 0); /* no audio */
+    }
+    spore_rt *rt = sp->rt;
+    free(sp->text);
+    free(sp->voice);
+    free(sp->pcm);
+    free(sp);
+    pthread_mutex_lock(&rt->mu);
+    rt->speaking--;
+    if (!--rt->live) pthread_cond_broadcast(&rt->cv);
+    pthread_mutex_unlock(&rt->mu);
+    return NULL;
+}
+
+static void on_speech(spore_req *req, spore_resp *resp, void *ud) {
+    spore_rt *rt = ud;
+    spore_json d = {0};
+    const char *err = NULL;
+    speech *sp = NULL;
+    if (spore_json_parse(&d, req->body, req->body_len) ||
+        spore_json_root(&d)->type != SPORE_JOBJ) {
+        err = "request body must be a JSON object";
+        goto fail;
+    }
+    const spore_jnode *o = spore_json_root(&d);
+    const spore_jnode *in = spore_json_get(&d, o, "input");
+    const spore_jnode *fmt = spore_json_get(&d, o, "response_format");
+    const spore_jnode *voice = spore_json_get(&d, o, "voice");
+    const spore_jnode *speed = spore_json_get(&d, o, "speed");
+    const spore_jnode *sf = spore_json_get(&d, o, "stream_format");
+    double sv = 1;
+    if (!in || in->type != SPORE_JSTR || !in->len || in->len > SPEECH_MAX_INPUT)
+        err = "'input' must be a string of 1 to 4096 bytes";
+    else if (fmt && !(fmt->type == SPORE_JSTR && (!strcmp(fmt->str, "wav") ||
+                                                  !strcmp(fmt->str, "pcm"))))
+        err = "'response_format' must be \"wav\" or \"pcm\"; mp3, opus, aac "
+              "and flac are not supported";
+    else if (voice && voice->type != SPORE_JSTR)
+        err = "'voice' must be a string";
+    else if (speed && speed->type != SPORE_JNULL &&
+             (spore_json_double(speed, &sv) || sv != 1))
+        err = "'speed' other than 1 is not supported";
+    else if (sf && !(sf->type == SPORE_JSTR && !strcmp(sf->str, "audio")))
+        err = "'stream_format' must be \"audio\"; SSE is not supported";
+    if (err) goto fail;
+    if (!(sp = calloc(1, sizeof *sp)) || !(sp->text = dupn(in->str, in->len)) ||
+        !(sp->voice = dup0(voice ? voice->str : rt->voice))) {
+        err = "out of memory";
+        goto fail;
+    }
+    sp->rt = rt;
+    sp->resp = resp;
+    sp->wav = !fmt || !strcmp(fmt->str, "wav");
+    spore_json_free(&d);
+    pthread_mutex_lock(&rt->mu);
+    int ok = rt->speaking < SPEECH_MAX_JOBS;
+    if (ok) rt->speaking++, rt->live++;
+    pthread_mutex_unlock(&rt->mu);
+    pthread_t t;
+    if (ok && pthread_create(&t, NULL, speech_thread, sp) == 0) {
+        pthread_detach(t);
+        return;
+    }
+    if (ok) {
+        pthread_mutex_lock(&rt->mu);
+        rt->speaking--;
+        if (!--rt->live) pthread_cond_broadcast(&rt->cv);
+        pthread_mutex_unlock(&rt->mu);
+    }
+    free(sp->text);
+    free(sp->voice);
+    free(sp);
+    speech_error(resp, 503, "server busy");
+    return;
+fail:
+    if (sp) free(sp->text);
+    free(sp);
+    spore_json_free(&d);
+    speech_error(resp, strcmp(err, "out of memory") ? 400 : 500, err);
+}
+
+spore_rt *spore_rt_new(spore_server *srv, const spore_rt_backend *be,
+                       const spore_rt_config *cfg) {
+    spore_rt *rt = spore__rt_detached(be, cfg);
+    if (rt && (spore_route(srv, "GET", "/v1/realtime", on_realtime, rt) ||
+               (be->tts.fn &&
+                spore_route(srv, "POST", "/v1/audio/speech", on_speech, rt)))) {
+        spore__unroute(srv, rt);
+        spore_rt_free(rt);
+        return NULL;
+    }
+    return rt;
+}
+
+/* ---- test entry points ------------------------------------------------------ */
+
+spore__rt_sess *spore__rt_open(spore_rt *rt) {
+    session *s = session_new(rt, NULL);
+    if (!s) return NULL;
+    if (!(s->ws = spore__ws_detached(&ws_config, s))) {
+        s->refs = 1;
+        session_unref(s);
+        return NULL;
+    }
+    pthread_mutex_lock(&s->mu);
+    send_session(s, "session.created");
+    pthread_mutex_unlock(&s->mu);
+    return s;
+}
+
+void spore__rt_event(spore__rt_sess *s, char *data, size_t len) {
+    on_message(s->ws, SPORE_WS_TEXT, data, len, s);
+    run_jobs(s, 0);
+}
+
+spore_ws *spore__rt_ws(spore__rt_sess *s) { return s->ws; }
+
+void spore__rt_close(spore__rt_sess *s) {
+    spore_ws *ws = s->ws;
+    spore__ws_gone(ws); /* on_close: drops the loop's reference */
+    spore_ws_release(ws);
+    session_unref(s);   /* the worker's */
 }
 
 void spore_rt_free(spore_rt *rt) {

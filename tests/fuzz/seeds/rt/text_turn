@@ -1,0 +1,2 @@
+{"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello there"}]}}
+{"type": "response.create"}

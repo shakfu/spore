@@ -1,0 +1,6 @@
+{"type": "conversation.item.create", "event_id": "e1", "item": {"id": "a", "type": "message", "role": "system", "content": [{"type": "input_text", "text": "sys"}]}}
+{"type": "conversation.item.create", "previous_item_id": "a", "item": {"id": "b", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}}
+{"type": "conversation.item.retrieve", "item_id": "b"}
+{"type": "conversation.item.truncate", "item_id": "b", "content_index": 0, "audio_end_ms": 0}
+{"type": "conversation.item.delete", "item_id": "a"}
+{"type": "conversation.item.delete", "item_id": "zz"}

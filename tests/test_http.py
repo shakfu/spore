@@ -133,13 +133,32 @@ def test_request_deadline_sends_408(spawn):
 
 
 def test_idle_connection_closed(spawn):
-    srv = spawn("--idle-ms", "300")
+    srv = spawn("--idle-ms", "200")
     with srv.connect() as s:
         s.sendall(get())
         read_response(s)
         t = time.time()
         assert closed_by_peer(s)
-        assert time.time() - t < 3
+        # The poll wait ends at the deadline, not at a 1 s tick.
+        assert 0.15 < time.time() - t < 0.6
+
+
+def test_half_close_still_answered(srv):
+    with srv.connect() as s:
+        s.sendall(get() + get("/nope"))
+        s.shutdown(socket.SHUT_WR)
+        assert read_response(s)[0] == 200
+        assert read_response(s)[0] == 404
+        assert closed_by_peer(s)
+
+
+def test_half_close_with_partial_request_closes(srv):
+    with srv.connect() as s:
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: loc")
+        s.shutdown(socket.SHUT_WR)
+        t = time.time()
+        assert closed_by_peer(s)
+        assert time.time() - t < 0.5
 
 
 def test_many_connections(srv):
@@ -186,6 +205,27 @@ def test_extra_origin_allowed(spawn):
     assert request(srv, get(extra="Origin: https://app.example.org\r\n"))[0] == 403
 
 
+def test_origins_only(spawn):
+    srv = spawn("--origins-only", "--origin", "https://app.example")
+    assert request(srv, get(extra="Origin: https://app.example\r\n"))[0] == 200
+    assert request(srv, get(extra="Origin: http://localhost:5173\r\n"))[0] == 403
+    assert request(srv, get())[0] == 200  # no Origin: not a browser request
+
+
+def test_extra_hosts(spawn):
+    srv = spawn("--host", "spore.example.com")
+    assert request(srv, get(host="Spore.Example.com"))[0] == 200
+    assert request(srv, get(host="spore.example.com:443"))[0] == 200
+    assert request(srv, get(host="localhost"))[0] == 200
+    assert request(srv, get(host="evil.com"))[0] == 403
+
+
+def test_extra_hosts_checked_on_unix_socket(spawn, tmp_path):
+    srv = spawn("--unix", str(tmp_path / "s.sock"), "--host", "spore.example.com")
+    assert request(srv, get(host="spore.example.com"))[0] == 200
+    assert request(srv, get(host="anything.example"))[0] == 403
+
+
 def test_preflight(spawn):
     srv = spawn("--token", "s3cret")
     raw = (
@@ -215,6 +255,20 @@ def test_token_rejection_keeps_pipelined_request(spawn):
         s.sendall(get() + get(extra="Authorization: Bearer t\r\n"))
         assert read_response(s)[0] == 401
         assert read_response(s)[0] == 200
+
+
+def test_token_file(spawn, tmp_path):
+    path = tmp_path / "token"
+    path.write_text("old")
+    os.chmod(path, 0o644)
+    srv = spawn("--token-file", str(path))
+    token = path.read_text().strip()
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert len(token) == 64 and int(token, 16) >= 0
+    assert srv.proc.stdout.readline().strip() == f"open http://localhost:{srv.port}/#token={token}"
+    assert request(srv, get())[0] == 401
+    assert request(srv, get(extra=f"Authorization: Bearer {token}\r\n"))[0] == 200
+    assert [p.name for p in tmp_path.iterdir()] == ["token"]  # no temp file left
 
 
 def test_unix_socket(spawn, tmp_path):

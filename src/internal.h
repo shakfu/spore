@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include "spore_ws.h"
+#include "spore_realtime.h"
 
 /* Parse a request head from buf[0..len). `scan` carries the search offset
  * for the blank line across calls; start it at 0. Returns the head length
@@ -16,8 +17,15 @@ long spore__parse_head(const char *buf, size_t len, size_t max_header,
 
 int spore__ieq(spore_str s, const char *cstr);          /* ASCII case-fold */
 int spore__has_token(spore_str list, const char *tok);  /* "a, b, c" list */
-int spore__host_allowed(spore_str host);
-int spore__origin_allowed(spore_str origin, const char *const *extra);
+/* Loopback names, or a name in `extra` (any port, ASCII case-fold). */
+int spore__host_allowed(spore_str host, const char *const *extra);
+/* An origin in `extra`, or with `loopback`, any http(s) loopback origin. */
+int spore__origin_allowed(spore_str origin, const char *const *extra,
+                          int loopback);
+
+/* Remove every route registered with `ud`, keeping the order of the rest.
+ * Lets a module undo a partial registration. Loop thread only. */
+void spore__unroute(spore_server *srv, void *ud);
 
 /* ---- connection upgrade (server.c) ----------------------------------- */
 
@@ -56,6 +64,24 @@ spore_resp *spore__resp_detached(void);
 spore_ws *spore__ws_detached(const spore_ws_config *cfg, void *ud);
 long spore__ws_feed(spore_ws *ws, char *data, size_t len);
 void spore__ws_gone(spore_ws *ws);
+
+spore_resp *spore__ws_resp(spore_ws *ws);
+/* Move the unsent output of a detached response to `dst`. */
+void spore__resp_take(spore_resp *resp, spore_buf *dst);
+
+/* ---- realtime test entry points (realtime.c) ------------------------- */
+
+/* A session without a server or worker thread; see
+ * tests/fuzz/fuzz_rt.c. spore__rt_event() handles one client event as the
+ * loop would, then runs the jobs it queued on the calling thread. */
+typedef struct spore__rt_sess spore__rt_sess;
+/* spore_rt_new() without the route. */
+spore_rt *spore__rt_detached(const spore_rt_backend *be,
+                             const spore_rt_config *cfg);
+spore__rt_sess *spore__rt_open(spore_rt *rt);
+void spore__rt_event(spore__rt_sess *s, char *data, size_t len);
+spore_ws *spore__rt_ws(spore__rt_sess *s);
+void spore__rt_close(spore__rt_sess *s);
 
 /* ---- shared helpers --------------------------------------------------- */
 

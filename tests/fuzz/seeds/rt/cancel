@@ -1,0 +1,4 @@
+{"type": "response.cancel"}
+{"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a b c"}]}}
+{"type": "response.create"}
+{"type": "response.cancel"}

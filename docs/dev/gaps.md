@@ -6,18 +6,13 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 | Gap | Effect | Suggested fix |
 |---|---|---|
-| Fuzzing not in CI | `make fuzz-run` exists but runs only by hand; the two targets have had about 150 s each | Run it in CI with a time budget; keep a persistent corpus |
 | Connection state machine not fuzzed | The fuzz targets cover the parsers only. Framing across reads, pipelining, `100-continue` and draining in `conn_service()` are covered only by the integration tests | A target that drives `spore_poll()` over a socketpair with fuzzed byte streams and split points |
-| Unbounded response buffer | `spore_write()` never refuses data. A client that stops reading while a worker streams makes `out` grow. Growth is bounded only by `max_tokens` | Return -1 (or block) above a per-response cap |
-| Partial routes on OOM | If `spore_route()` fails partway through `spore_llm_new()`, the routes already added keep a pointer to the freed handle | Register all routes before any other allocation that can fail, or add route removal |
-| Half-close aborts responses | A client that sends its request and then `shutdown(SHUT_WR)`s reads EOF. The loop treats this as a disconnect and cancels the response | Treat EOF as a close only when no response is active |
-| Hang-up missed with a full buffer | When the input buffer is full, the loop does not read. A `POLLHUP` then goes undetected until the response ends | Check `POLLHUP` separately from reads |
+| A closed TCP client is seen only on write | EOF is a half-close, so a TCP client that closes is noticed when a write fails. A non-streaming LLM reply keeps generating until it ends. Unix-socket peers raise `POLLHUP` and are noticed at once | None that keeps half-close: TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing |
+| `POLLHUP` read as POSIX defines it | `POLLHUP` closes the connection: POSIX makes it exclusive with `POLLOUT`. If a platform raises it on a half-close alone, as macOS may, half-closed clients lose their responses there. Linux was tested; macOS was not | Test on macOS |
 
 ## HTTP server
 
 - **Static files are read whole.** `spore_serve_dir()` loads each file into memory. It suits UI assets, not large media. Fix: stream in chunks, or use `sendfile()`.
-
-- **Timeouts fire up to 1 s late.** `spore_poll()` caps its wait at 1 s instead of computing the next deadline.
 
 - **No Windows support.** Porting needs `WSAPoll`, a socketpair in place of the self-pipe, and a peer-credential check for named pipes.
 
@@ -25,11 +20,11 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 ## WebSockets
 
-- **No Autobahn run.** Conformance rests on the integration tests, the `websockets` client and `fuzz_ws`. The [Autobahn testsuite](https://github.com/crossbario/autobahn-testsuite) needs Docker and has not been run.
+- **Autobahn not yet run.** `make autobahn` and the CI job run the [Autobahn testsuite](https://github.com/crossbario/autobahn-testsuite) against `/ws/echo`, but no result has been recorded: the development host has no Docker. Messages over 1 MiB (`max_message`) and compression cases are excluded.
 
 - **No keep-alive pings.** On loopback and Unix sockets, the kernel closes a dead process's sockets, so a vanished peer is always seen. Pings would only detect a hung process, such as one stopped in a debugger. Browsers answer pings in their network stack, so a frozen tab would still pass.
 
-- **Unbounded send queue.** `spore_ws_send()` never refuses data, like `spore_write()` (see above). Real-time producers should check `spore_ws_pending()`.
+- **Send queue overflow closes.** A send past `spore_config.max_pending` closes the connection; there is no blocking send. Real-time producers should check `spore_ws_pending()` and drop frames first.
 
 - **No extensions.** `permessage-deflate` is not offered. Compressed audio gains little from it.
 
@@ -37,15 +32,15 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 ## Realtime
 
-- **No fuzz target for client events.** Event parsing uses the fuzzed JSON reader, but the session state machine and base64 decoding are covered only by integration tests. A target that feeds events to a detached session would close this.
-
 - **Energy VAD.** Background noise above the threshold starts turns. `semantic_vad` is accepted but maps `eagerness` onto silence lengths (300/600/1200 ms).
 
 - **Not implemented:** tools and function calls, G.711 (`audio/pcmu`, `audio/pcma`), transcription-only sessions, out-of-band responses (`conversation: "none"`, `response.input`), `idle_timeout_ms`, input transcription deltas, and audio in `conversation.item.retrieved` (only lengths are stored).
 
 - **One content part per item.** Multi-part user messages are joined into one text.
 
-- **Per-chunk resampling of synthesized audio.** Chunks are resampled independently, so a TTS rate other than 24 kHz gets small discontinuities at chunk edges. OuteTTS produces 24 kHz, so no resampling happens there.
+- **`/v1/audio/speech` encodes only WAV and raw PCM.** OpenAI's default, `mp3`, gets 400; so do `opus`, `aac` and `flac`. An omitted `response_format` gives WAV.
+
+- **Per-chunk resampling of synthesized audio** (realtime, and `pcm` from `/v1/audio/speech`). Chunks are resampled independently, so a TTS rate other than 24 kHz gets small discontinuities at chunk edges. OuteTTS produces 24 kHz, so no resampling happens there.
 
 - **No rate limits.** `rate_limits.updated` is never sent. Clients treat it as optional.
 
@@ -65,16 +60,16 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 ## LLM layer
 
-- **One prompt-cache slot.** The llama backend caches only the most recent token sequence. Two clients with interleaved conversations evict each other and fall back to full evaluation. llama-server keeps one cache per slot (`-np`).
+- **Prompt-cache slots share one KV buffer.** Attention covers the cells of every slot, so filled slots slow generation (about 14% with three 2k-token slots on CPU). Separate buffers would split `n_ctx` between slots instead.
 
 - **No context shift.** A conversation that fills `n_ctx` ends with `finish_reason: "length"`; nothing is discarded to make room.
 
 - **No batching.** One context behind a mutex. `workers > 1` gains nothing with `spore_llama`.
 
-- **`<think>` blocks stay in `content`.** llama-server moves them to `reasoning_content`. The parsing depends on the model.
+- **Only a leading `<think>` block is separated.** A template that opens the block in the prompt (the reply starts inside it) is not detected. The realtime module passes the raw text to TTS, so a thinking model's reasoning would be spoken.
 
 - **Unsupported request features:** tool calls, image and audio content, `n > 1`, logprobs, token-array inputs to embeddings.
 
-- **Generic backend errors.** The backend API has no error message. A prompt longer than the context returns 500 "generation failed", not a 400 that names the cause.
+- **Embedding errors are generic.** `embed` returns only -1, so an input longer than the batch gets 500 without a cause.
 
 - **Embeddings are printed with 17 digits.** Float vectors go out at double precision. That matches llama-server, but `%.9g` would round-trip float32 in about half the bytes. `encoding_format: "base64"` already avoids the cost.

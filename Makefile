@@ -27,7 +27,7 @@ FUZZ_TIME ?= 60
 FUZZ      = build-fuzz
 
 .PHONY: all configure test unit replay integration asan tsan check-modules \
-        fuzz fuzz-run engines test-engines install clean
+        fuzz fuzz-run autobahn engines test-engines install clean
 
 all: configure
 	$(CMAKE) --build $(BUILD) -j$(JOBS)
@@ -67,19 +67,26 @@ check-modules:
 
 # ---- libFuzzer (clang) -------------------------------------------------------
 # New corpus entries go to build-fuzz/corpus-*; copy crash reproducers into
-# tests/fuzz/seeds/ so `make test` replays them.
+# tests/fuzz/seeds/ so `make test` replays them. FUZZ_TIME is per target.
 
 fuzz:
 	@$(CMAKE) -S . -B $(FUZZ) -DCMAKE_C_COMPILER=$(FUZZ_CC) -DSPORE_FUZZ=ON \
 		-DSPORE_BUILD_TESTS=OFF -DSPORE_BUILD_EXAMPLES=OFF > /dev/null
-	$(CMAKE) --build $(FUZZ) -j$(JOBS) --target fuzz_http fuzz_json fuzz_ws
+	$(CMAKE) --build $(FUZZ) -j$(JOBS) --target fuzz_http fuzz_json fuzz_ws fuzz_rt
 
 fuzz-run: fuzz
-	for t in http json ws; do \
+	for t in http json ws rt; do \
 		mkdir -p $(FUZZ)/corpus-$$t; \
 		$(FUZZ)/fuzz_$$t -max_total_time=$(FUZZ_TIME) -dict=tests/fuzz/$$t.dict \
 			-artifact_prefix=$(FUZZ)/ $(FUZZ)/corpus-$$t tests/fuzz/seeds/$$t || exit 1; \
 	done
+
+# ---- Autobahn WebSocket testsuite (needs Docker) -----------------------------
+# The fuzzing client connects to spored's /ws/echo over the host network.
+# Reports go to $(BUILD)/autobahn/index.html.
+
+autobahn: all
+	python3 tests/autobahn/run.py $(BUILD)/spored $(BUILD)/autobahn
 
 # ---- engine adapters -------------------------------------------------------
 # spored-engines: llama.cpp (LLM) and whisper.cpp (ASR) behind the mock TTS.

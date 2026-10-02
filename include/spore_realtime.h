@@ -59,7 +59,8 @@ typedef struct {
     int max_input_s;          /* input audio buffer cap in seconds; 600 */
 } spore_rt_config;
 
-/* Register GET /v1/realtime. The backend is copied; the objects it points
+/* Register GET /v1/realtime, and POST /v1/audio/speech when tts.fn is
+ * set. The backend is copied; the objects it points
  * to must outlive the handle. Returns NULL on failure. */
 spore_rt *spore_rt_new(spore_server *srv, const spore_rt_backend *be,
                        const spore_rt_config *cfg);

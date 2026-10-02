@@ -167,7 +167,7 @@ long spore_query_get(const spore_req *req, const char *key, char *dst,
 }
 
 /* host = "localhost" | "*.localhost" | "127.0.0.1" | "[::1]", optional port */
-int spore__host_allowed(spore_str h) {
+int spore__host_allowed(spore_str h, const char *const *extra) {
     size_t n = h.len;
     const char *colon = NULL;
     if (n && h.ptr[0] == '[') {
@@ -187,20 +187,24 @@ int spore__host_allowed(spore_str h) {
     if (spore__ieq(name, "localhost") || spore__ieq(name, "127.0.0.1") ||
         spore__ieq(name, "[::1]"))
         return 1;
+    for (; extra && *extra; extra++)
+        if (**extra && spore__ieq(name, *extra)) return 1;
     /* RFC 6761: *.localhost always resolves to loopback. */
     static const char sfx[] = ".localhost";
     size_t sl = sizeof sfx - 1;
     return n > sl && spore__ieq((spore_str){name.ptr + n - sl, sl}, sfx);
 }
 
-int spore__origin_allowed(spore_str o, const char *const *extra) {
+int spore__origin_allowed(spore_str o, const char *const *extra,
+                          int loopback) {
     for (; extra && *extra; extra++)
         if (spore_str_eq(o, *extra)) return 1;
+    if (!loopback) return 0;
     size_t skip;
     if (o.len > 7 && memcmp(o.ptr, "http://", 7) == 0) skip = 7;
     else if (o.len > 8 && memcmp(o.ptr, "https://", 8) == 0) skip = 8;
     else return 0;
     spore_str host = {o.ptr + skip, o.len - skip};
     if (memchr(host.ptr, '/', host.len)) return 0;
-    return spore__host_allowed(host);
+    return spore__host_allowed(host, NULL);
 }

@@ -59,11 +59,16 @@ typedef struct {
     const char *unix_path;      /* bind this Unix socket instead of TCP */
     const char *token;          /* require "Authorization: Bearer <token>" */
     const char *const *origins; /* NULL-terminated extra allowed Origins */
+    int origins_only;           /* allow only `origins`, no loopback ones */
+    /* NULL-terminated extra allowed Host names, any port. When set, Host is
+     * checked on a Unix socket too, e.g. behind a reverse proxy. */
+    const char *const *hosts;
     size_t max_conns;           /* 64 */
     size_t max_header;          /* 8192 bytes */
     size_t max_body;            /* 8 MiB */
     int idle_ms;                /* keep-alive idle timeout, 30000 */
     int request_ms;             /* deadline to receive a request, 30000 */
+    size_t max_pending;         /* 16 MiB of unsent streamed output */
 } spore_config;
 
 /* Server lifecycle. spore_new() returns NULL and sets errno on failure. */
@@ -104,7 +109,9 @@ long spore_query_get(const spore_req *req, const char *key, char *dst,
 int spore_set_header(spore_resp *resp, const char *name, const char *value);
 int spore_reply(spore_resp *resp, int status, const char *ctype,
                 const void *body, size_t len);
-/* Streaming: chunked on HTTP/1.1, close-delimited on HTTP/1.0. */
+/* Streaming: chunked on HTTP/1.1, close-delimited on HTTP/1.0. A write
+ * that would queue more than max_pending unsent bytes fails and closes the
+ * connection, as if the client had left. */
 int spore_begin(spore_resp *resp, int status, const char *ctype);
 int spore_write(spore_resp *resp, const void *data, size_t len);
 /* Server-Sent Events: spore_begin() with "text/event-stream" first.

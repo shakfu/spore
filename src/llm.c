@@ -29,6 +29,7 @@ typedef struct job {
     size_t n_stop;
     int stream;
     int include_usage;
+    int reasoning; /* chat: move a leading <think> block to reasoning_content */
     const spore_jnode *input; /* embeddings */
     int base64;
     char id[48];
@@ -155,6 +156,15 @@ static int parse_sampling(job *j, const spore_jnode *o, const char **err) {
     const spore_jnode *so = spore_json_get(d, o, "stream_options");
     spore_json_bool(spore_json_get(d, so, "include_usage"), &j->include_usage);
 
+    const spore_jnode *rf = spore_json_get(d, o, "reasoning_format");
+    if (rf && rf->type == SPORE_JSTR && strcmp(rf->str, "none") == 0)
+        j->reasoning = 0;
+    else if (rf && rf->type != SPORE_JNULL &&
+             !(rf->type == SPORE_JSTR && (!strcmp(rf->str, "auto") ||
+                                          !strcmp(rf->str, "deepseek") ||
+                                          !strcmp(rf->str, "deepseek-legacy"))))
+        FAIL("'reasoning_format' must be \"none\", \"auto\" or \"deepseek\"");
+
     const spore_jnode *tools = spore_json_get(d, o, "tools");
     if (tools && tools->type == SPORE_JARR && tools->len)
         FAIL("tools are not supported");
@@ -223,6 +233,7 @@ static int parse_chat(job *j, const spore_jnode *o, const char **err) {
     }
     j->p.messages = j->msgs;
     j->p.n_messages = ms->len;
+    j->reasoning = 1;
     return parse_sampling(j, o, err);
 }
 
@@ -320,7 +331,14 @@ typedef struct {
     size_t sent;   /* acc prefix already streamed, or checked for stops */
     int matched;   /* a stop sequence ended generation */
     int dead;      /* client gone or shutting down */
+    int begun;     /* stream head sent */
+    int mode;      /* R_*: where acc[sent..] goes */
+    spore_buf content, reasoning; /* the split of acc[..sent) */
 } gen;
+
+/* A leading <think> block, as Qwen3 emits, goes to
+ * reasoning_content, with the whitespace around it trimmed. */
+enum { R_DETECT, R_THINK_TRIM, R_THINK, R_CONTENT_TRIM, R_CONTENT };
 
 static const char *find(const char *h, size_t hl, const char *n, size_t nl) {
     if (nl > hl) return NULL;
@@ -339,13 +357,37 @@ static void chunk_head(gen *g, spore_buf *b) {
     spore_json_str(b, g->llm->be.model, strlen(g->llm->be.model));
 }
 
+/* The stream head waits for the first event, so a request the backend
+ * rejects before any output still gets a 4xx status. */
+static void open_stream(gen *g) {
+    job *j = g->j;
+    g->begun = 1;
+    spore_set_header(j->resp, "Cache-Control", "no-cache");
+    if (spore_begin(j->resp, 200, "text/event-stream")) {
+        g->dead = 1;
+        return;
+    }
+    if (j->kind == JOB_CHAT) { /* OpenAI opens with the role alone */
+        spore_buf b = {0};
+        chunk_head(g, &b);
+        spore_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":"
+                           "{\"role\":\"assistant\",\"content\":\"\"},"
+                           "\"finish_reason\":null}]}");
+        if (b.err || spore_sse(j->resp, NULL, b.ptr, b.len)) g->dead = 1;
+        spore_buf_free(&b);
+    }
+}
+
 static void send_event(gen *g, spore_buf *b) {
-    if (b->err || spore_sse(g->j->resp, NULL, b->ptr, b->len)) g->dead = 1;
+    if (!g->begun) open_stream(g);
+    if (g->dead || b->err || spore_sse(g->j->resp, NULL, b->ptr, b->len))
+        g->dead = 1;
     spore_buf_free(b);
 }
 
-/* One streamed delta, or the final chunk when finish != NULL. */
-static void send_delta(gen *g, const char *text, size_t len,
+/* One streamed delta in `field` ("content" or "reasoning_content"), or
+ * the final chunk when finish != NULL. */
+static void send_delta(gen *g, const char *field, const char *text, size_t len,
                        const char *finish) {
     spore_buf b = {0};
     chunk_head(g, &b);
@@ -353,7 +395,7 @@ static void send_delta(gen *g, const char *text, size_t len,
     if (g->j->kind == JOB_CHAT) {
         spore_buf_puts(&b, "\"delta\":{");
         if (text) {
-            spore_buf_puts(&b, "\"content\":");
+            spore_buf_printf(&b, "\"%s\":", field);
             spore_json_str(&b, text, len);
         }
         spore_buf_puts(&b, "}");
@@ -367,16 +409,80 @@ static void send_delta(gen *g, const char *text, size_t len,
     send_event(g, &b);
 }
 
-static void advance(gen *g, size_t to) {
+static void out(gen *g, int think, size_t to) {
     if (to <= g->sent) return;
-    if (g->j->stream) send_delta(g, g->acc.ptr + g->sent, to - g->sent, NULL);
+    const char *p = g->acc.ptr + g->sent;
+    size_t n = to - g->sent;
+    spore_buf_add(think ? &g->reasoning : &g->content, p, n);
+    if (g->j->stream)
+        send_delta(g, think ? "reasoning_content" : "content", p, n, NULL);
     g->sent = to;
+}
+
+static int space(char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
+
+/* Pass acc[sent..to) on. Unless `final`, text that may still turn out to
+ * be (part of) a tag, or whitespace to trim, is held back. */
+static void advance(gen *g, size_t to, int final) {
+    static const char open[] = "<think>", close[] = "</think>";
+    const char *a = g->acc.ptr;
+    while (g->sent < to) {
+        size_t i = g->sent;
+        switch (g->mode) {
+        case R_DETECT: {
+            while (i < to && space(a[i])) i++;
+            size_t m = to - i < 7 ? to - i : 7;
+            if (memcmp(a + i, open, m) != 0) {
+                g->mode = R_CONTENT;
+            } else if (m == 7) {
+                g->sent = i + 7;
+                g->mode = R_THINK_TRIM;
+            } else if (final) {
+                g->mode = R_CONTENT;
+            } else {
+                return;
+            }
+            break;
+        }
+        case R_THINK_TRIM:
+        case R_CONTENT_TRIM:
+            while (i < to && space(a[i])) i++;
+            g->sent = i;
+            if (i == to && !final) return;
+            g->mode = g->mode == R_THINK_TRIM ? R_THINK : R_CONTENT;
+            break;
+        case R_THINK: {
+            const char *e = find(a + i, to - i, close, 8);
+            size_t end = e ? (size_t)(e - a) : to;
+            if (!e && !final) /* hold a partial "</think>" */
+                for (size_t h = 7; h > 0; h--)
+                    if (to - i >= h && memcmp(a + to - h, close, h) == 0) {
+                        end = to - h;
+                        break;
+                    }
+            size_t keep = end; /* trailing whitespace waits for more text */
+            while (keep > i && space(a[keep - 1])) keep--;
+            out(g, 1, keep);
+            if (e) {
+                g->sent = end + 8;
+                g->mode = R_CONTENT_TRIM;
+            } else {
+                if (final) g->sent = to;
+                return;
+            }
+            break;
+        }
+        default:
+            out(g, 0, to);
+        }
+    }
 }
 
 static int emit(void *ctx, const char *text, size_t len) {
     gen *g = ctx;
     if (g->matched || g->dead) return 1;
-    if (atomic_load(&g->llm->shutdown)) {
+    /* Without streaming, no write fails when the client leaves. */
+    if (atomic_load(&g->llm->shutdown) || spore_closed(g->j->resp)) {
         g->dead = 1;
         return 1;
     }
@@ -395,7 +501,7 @@ static int emit(void *ctx, const char *text, size_t len) {
     }
     if (first) {
         g->acc.len = (size_t)(first - g->acc.ptr);
-        advance(g, g->acc.len);
+        advance(g, g->acc.len, 0);
         g->matched = 1;
         return 1;
     }
@@ -410,7 +516,7 @@ static int emit(void *ctx, const char *text, size_t len) {
                 break;
             }
     }
-    advance(g, spore__utf8_cut(g->acc.ptr, g->sent, g->acc.len - hold));
+    advance(g, spore__utf8_cut(g->acc.ptr, g->sent, g->acc.len - hold), 0);
     return g->dead;
 }
 
@@ -428,35 +534,26 @@ static void usage_json(spore_buf *b, const spore_llm_usage *u) {
 }
 
 static void run_generate(spore_llm *llm, job *j) {
-    gen g = {llm, j, {0}, 0, 0, 0};
-    spore_llm_usage usage = {0, 0, 0};
-    if (j->stream) {
-        spore_set_header(j->resp, "Cache-Control", "no-cache");
-        if (spore_begin(j->resp, 200, "text/event-stream")) {
-            spore_end(j->resp);
-            return;
-        }
-        if (j->kind == JOB_CHAT) { /* OpenAI opens with the role alone */
-            spore_buf b = {0};
-            chunk_head(&g, &b);
-            spore_buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":"
-                               "{\"role\":\"assistant\",\"content\":\"\"},"
-                               "\"finish_reason\":null}]}");
-            send_event(&g, &b);
-        }
-    }
+    gen g = {.llm = llm, .j = j, .mode = j->reasoning ? R_DETECT : R_CONTENT};
+    spore_llm_usage usage = {0};
     spore_llm_finish f = llm->be.generate(llm->be.self, &j->p, emit, &g, &usage);
-    if (!g.matched && !g.dead) advance(&g, g.acc.len);
+    if (!g.dead) advance(&g, g.acc.len, 1);
+    int failed = (f == SPORE_LLM_ERROR || f == SPORE_LLM_INVALID) && !g.matched;
+    int status = f == SPORE_LLM_INVALID ? 400 : 500;
+    usage.error[sizeof usage.error - 1] = '\0';
+    const char *msg = usage.error[0] ? usage.error : "generation failed";
 
-    if (j->stream) {
+    if (j->stream && failed && !g.begun && !g.dead) {
+        reply_error(j->resp, status, msg);
+    } else if (j->stream) {
         if (g.dead) {
             /* client gone or shutting down: just close */
-        } else if (f == SPORE_LLM_ERROR && !g.matched) {
+        } else if (failed) {
             spore_buf b = {0};
-            error_body(&b, "generation failed", 500);
+            error_body(&b, msg, status);
             send_event(&g, &b);
         } else {
-            send_delta(&g, NULL, 0, finish_name(f, g.matched));
+            send_delta(&g, NULL, NULL, 0, finish_name(f, g.matched));
             if (j->include_usage) {
                 spore_buf b = {0};
                 chunk_head(&g, &b);
@@ -468,9 +565,9 @@ static void run_generate(spore_llm *llm, job *j) {
             spore_sse(j->resp, NULL, "[DONE]", 6);
         }
         spore_end(j->resp);
-    } else if (f == SPORE_LLM_ERROR && !g.matched) {
-        reply_error(j->resp, 500, "generation failed");
-    } else if (g.dead || g.acc.err) {
+    } else if (failed) {
+        reply_error(j->resp, status, msg);
+    } else if (g.dead || g.acc.err || g.content.err || g.reasoning.err) {
         reply_error(j->resp, 500, "generation aborted");
     } else {
         spore_buf b = {0};
@@ -483,11 +580,15 @@ static void run_generate(spore_llm *llm, job *j) {
         spore_buf_puts(&b, ",\"choices\":[{\"index\":0,");
         if (j->kind == JOB_CHAT) {
             spore_buf_puts(&b, "\"message\":{\"role\":\"assistant\",\"content\":");
-            spore_json_str(&b, g.acc.ptr ? g.acc.ptr : "", g.acc.len);
+            spore_json_str(&b, g.content.ptr ? g.content.ptr : "", g.content.len);
+            if (g.reasoning.len) {
+                spore_buf_puts(&b, ",\"reasoning_content\":");
+                spore_json_str(&b, g.reasoning.ptr, g.reasoning.len);
+            }
             spore_buf_puts(&b, "}");
         } else {
             spore_buf_puts(&b, "\"text\":");
-            spore_json_str(&b, g.acc.ptr ? g.acc.ptr : "", g.acc.len);
+            spore_json_str(&b, g.content.ptr ? g.content.ptr : "", g.content.len);
             spore_buf_puts(&b, ",\"logprobs\":null");
         }
         spore_buf_printf(&b, ",\"finish_reason\":\"%s\"}],",
@@ -497,6 +598,8 @@ static void run_generate(spore_llm *llm, job *j) {
         reply_json(j->resp, 200, &b);
     }
     spore_buf_free(&g.acc);
+    spore_buf_free(&g.content);
+    spore_buf_free(&g.reasoning);
 }
 
 static void run_embed(spore_llm *llm, job *j) {
@@ -627,18 +730,21 @@ spore_llm *spore_llm_new(spore_server *srv, const spore_llm_backend *be,
     pthread_cond_init(&llm->cv, NULL);
     llm->threads = calloc(llm->n_threads, sizeof *llm->threads);
     if (!llm->threads) goto fail;
-    if (spore_route(srv, "GET", "/health", on_health, llm) ||
-        spore_route(srv, "GET", "/v1/models", on_models, llm) ||
-        (be->generate &&
-         (spore_route(srv, "POST", "/v1/chat/completions", on_chat, llm) ||
-          spore_route(srv, "POST", "/v1/completions", on_completion, llm))) ||
-        (be->embed && spore_route(srv, "POST", "/v1/embeddings", on_embed, llm)))
-        goto fail;
     size_t started = 0;
     for (; started < llm->n_threads; started++)
         if (pthread_create(&llm->threads[started], NULL, worker, llm)) break;
     llm->n_threads = started;
     if (!started) goto fail;
+    if (spore_route(srv, "GET", "/health", on_health, llm) ||
+        spore_route(srv, "GET", "/v1/models", on_models, llm) ||
+        (be->generate &&
+         (spore_route(srv, "POST", "/v1/chat/completions", on_chat, llm) ||
+          spore_route(srv, "POST", "/v1/completions", on_completion, llm))) ||
+        (be->embed && spore_route(srv, "POST", "/v1/embeddings", on_embed, llm))) {
+        spore__unroute(srv, llm); /* none may point at the freed handle */
+        spore_llm_free(llm);
+        return NULL;
+    }
     return llm;
 fail:
     free(llm->threads);

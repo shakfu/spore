@@ -7,12 +7,14 @@ the speech-output tests also need SPORE_TTS_MODEL and SPORE_VOCODER.
 """
 
 import base64
+import io
 import json
 import os
 import re
 import struct
 import subprocess
 import time
+import urllib.request
 import wave
 
 import pytest
@@ -173,6 +175,20 @@ def test_outetts_speech_round_trips_through_whisper(echo_port, text):
     heard = transcribe(echo_port, pcm)
     assert words(heard) == words(text.replace("42", "forty two")) or words(heard) == words(text), heard
     print(f"\n{seconds:.2f} s of speech synthesized in {took:.2f} s; heard {heard!r}")
+
+
+@needs_tts
+def test_speech_endpoint_round_trips_through_whisper(echo_port):
+    text = "The quick brown fox jumps over the lazy dog."
+    req = urllib.request.Request(f"http://127.0.0.1:{echo_port}/v1/audio/speech",
+                                 json.dumps({"input": text}).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        assert r.headers["Content-Type"] == "audio/wav"
+        with wave.open(io.BytesIO(r.read())) as w:
+            assert w.getframerate() == 24000
+            pcm = w.readframes(w.getnframes())
+    heard = transcribe(echo_port, pcm)
+    assert words(heard) == words(text), heard
 
 
 @needs_tts

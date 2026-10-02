@@ -287,6 +287,23 @@ def test_slow_reader_makes_producer_drop(srv):
     assert got == summary["sent"]
 
 
+def test_reader_that_stops_is_disconnected(srv):
+    # 256 MiB offered, never dropped by the producer. The server queues at
+    # most max_pending (16 MiB) and then closes, instead of growing.
+    s, rest = upgraded(srv, "/ws/stream?frames=4096&size=65536")
+    time.sleep(1.5)
+    total = len(rest)
+    s.settimeout(10)
+    with contextlib.suppress(ConnectionResetError):
+        while chunk := s.recv(1 << 20):
+            total += len(chunk)
+    s.close()
+    assert total < 64 << 20
+    with websockets.connect(url(srv, "/ws/echo")) as ws:  # server still serves
+        ws.send("alive")
+        assert ws.recv() == "alive"
+
+
 def test_client_vanishing_mid_stream(srv):
     s, _ = upgraded(srv, "/ws/stream?frames=100000&size=4096")
     s.recv(65536)

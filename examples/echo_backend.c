@@ -4,11 +4,14 @@
  * Prefixes in the echoed text change behaviour, for tests:
  *   "slow:"   sleep 50 ms before each word
  *   "fail:"   return SPORE_LLM_ERROR after the first word
+ *   "invalid:" return SPORE_LLM_INVALID before any output
  *   "bytes:"  emit one byte at a time, splitting UTF-8 sequences
+ *   "chop:"   emit the text after the prefix one byte at a time
  */
 #define _POSIX_C_SOURCE 200809L
 #include "echo_backend.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -39,6 +42,14 @@ static spore_llm_finish generate(void *self, const spore_llm_params *p,
     int slow = strncmp(text, "slow:", 5) == 0;
     int fail = strncmp(text, "fail:", 5) == 0;
     int bytes = strncmp(text, "bytes:", 6) == 0;
+    if (strncmp(text, "chop:", 5) == 0) {
+        text += 5;
+        bytes = 1;
+    }
+    if (strncmp(text, "invalid:", 8) == 0) {
+        snprintf(u->error, sizeof u->error, "echo: rejected '%.20s'", text);
+        return SPORE_LLM_INVALID;
+    }
     const char *s = text;
     while (*s) {
         if (p->max_tokens >= 0 && u->completion_tokens >= p->max_tokens)
@@ -51,7 +62,10 @@ static spore_llm_finish generate(void *self, const spore_llm_params *p,
         if (slow) nanosleep(&(struct timespec){0, 50 * 1000000L}, NULL);
         u->completion_tokens++;
         if (emit(ctx, s, (size_t)(e - s))) return SPORE_LLM_STOP;
-        if (fail) return SPORE_LLM_ERROR;
+        if (fail) {
+            snprintf(u->error, sizeof u->error, "echo: failure requested");
+            return SPORE_LLM_ERROR;
+        }
         s = e;
     }
     return SPORE_LLM_STOP;

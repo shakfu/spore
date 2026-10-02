@@ -54,12 +54,16 @@ typedef struct {
     int prompt_tokens;
     int completion_tokens;
     int cached_tokens; /* prompt tokens reused from a cache, if any */
+    /* With SPORE_LLM_ERROR or SPORE_LLM_INVALID: why, for the client. */
+    char error[160];
 } spore_llm_usage;
 
 typedef enum {
     SPORE_LLM_STOP,   /* end of generation, or emit returned nonzero */
     SPORE_LLM_LENGTH, /* max_tokens or context exhausted */
-    SPORE_LLM_ERROR
+    SPORE_LLM_ERROR,
+    SPORE_LLM_INVALID /* the request cannot be served as sent, e.g. a prompt
+                         longer than the context: HTTP 400 */
 } spore_llm_finish;
 
 typedef struct {

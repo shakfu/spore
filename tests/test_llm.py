@@ -3,13 +3,14 @@
 import base64
 import http.client
 import json
+import socket
 import struct
 import threading
 import time
 
 import pytest
 
-from conftest import requires
+from conftest import read_response, requires
 
 pytestmark = requires("llm")
 
@@ -127,6 +128,46 @@ def test_stream_never_splits_utf8(srv):
     assert "".join(parts) == text
 
 
+def test_think_block_becomes_reasoning_content(srv):
+    text = "chop: \n<think>\n plan  a\n</think>\n\nanswer </think>"
+    status, r = post(srv, "/v1/chat/completions", chat(text))
+    msg = r["choices"][0]["message"]
+    assert msg["reasoning_content"] == "plan  a"
+    assert msg["content"] == "answer </think>"
+    ev = stream(srv, "/v1/chat/completions", chat(text))
+    deltas = [e["choices"][0]["delta"] for e in ev[:-1] if e["choices"]]
+    assert "".join(d.get("reasoning_content", "") for d in deltas) == "plan  a"
+    assert "".join(d.get("content", "") for d in deltas) == "answer </think>"
+
+
+@pytest.mark.parametrize(
+    "text, content",
+    [
+        ("chop:<think>\n\n</think>\n\nhi", "hi"),  # empty block: no field
+        ("chop:say <think>x</think>", "say <think>x</think>"),  # not leading
+        ("chop:<thin", "<thin"),  # a prefix of the tag, then the end
+    ],
+)
+def test_think_edge_cases(srv, text, content):
+    msg = post(srv, "/v1/chat/completions", chat(text))[1]["choices"][0]["message"]
+    assert msg["content"] == content and "reasoning_content" not in msg
+
+
+def test_unterminated_think_is_all_reasoning(srv):
+    msg = post(srv, "/v1/chat/completions", chat("chop:<think>still going"))[1]["choices"][0]["message"]
+    assert msg["reasoning_content"] == "still going" and msg["content"] == ""
+
+
+def test_reasoning_format_none_keeps_raw_text(srv):
+    text = "chop:<think>p</think>a"
+    r = post(srv, "/v1/chat/completions", chat(text, reasoning_format="none"))[1]
+    assert r["choices"][0]["message"]["content"] == "<think>p</think>a"
+    status, r = post(srv, "/v1/chat/completions", chat(text, reasoning_format="x"))
+    assert status == 400 and "reasoning_format" in r["error"]["message"]
+    r = post(srv, "/v1/completions", {"prompt": text})[1]  # completions: raw
+    assert r["choices"][0]["text"] == "<think>p</think>a"
+
+
 def test_content_parts_joined(srv):
     msg = {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
     _, r = post(srv, "/v1/chat/completions", {"messages": [msg]})
@@ -157,9 +198,18 @@ def test_invalid_requests(srv, payload, needle):
 
 def test_backend_error(srv):
     status, r = post(srv, "/v1/chat/completions", chat("fail: now"))
-    assert status == 500 and "failed" in r["error"]["message"]
+    assert status == 500 and r["error"]["message"] == "echo: failure requested"
     ev = stream(srv, "/v1/chat/completions", chat("fail: now"))
-    assert "error" in ev[-1]
+    assert ev[-1]["error"]["message"] == "echo: failure requested"
+
+
+def test_backend_rejection_is_400_even_when_streaming(srv):
+    status, r = post(srv, "/v1/chat/completions", chat("invalid: x"))
+    assert status == 400 and r["error"]["message"].startswith("echo: rejected")
+    assert r["error"]["type"] == "invalid_request_error"
+    status, ctype, data = call(srv, "/v1/chat/completions", chat("invalid: x", stream=True))
+    assert status == 400 and ctype == "application/json"
+    assert json.loads(data)["error"]["message"].startswith("echo: rejected")
 
 
 def test_embeddings(srv):
@@ -193,6 +243,40 @@ def test_disconnect_cancels_generation(spawn):
     assert status == 200 and r["choices"][0]["message"]["content"] == "next"
     elapsed = time.time() - t
     assert elapsed < 1.0, elapsed
+
+
+def raw_post(path, payload):
+    body = json.dumps(payload).encode()
+    return (
+        f"POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+
+
+def test_half_closed_client_gets_whole_reply(srv):
+    with srv.connect() as s:
+        s.sendall(raw_post("/v1/chat/completions", chat("slow: a b c")))
+        s.shutdown(socket.SHUT_WR)
+        status, _, body = read_response(s)
+    assert status == 200
+    assert json.loads(body)["choices"][0]["message"]["content"] == "slow: a b c"
+
+
+def test_hangup_with_full_input_buffer_cancels(spawn, tmp_path):
+    # Input past the 8 KiB head limit stays unread while the reply is
+    # pending. Closing a Unix socket raises POLLHUP, which must still cancel.
+    srv = spawn("--unix", str(tmp_path / "s.sock"), "--workers", "1")
+    s = srv.connect()
+    s.sendall(raw_post("/v1/chat/completions", chat("slow:" + " w" * 60)))
+    s.sendall(b"x" * 32768)
+    time.sleep(0.2)
+    s.close()
+    t = time.time()
+    with srv.connect() as s2:
+        s2.sendall(raw_post("/v1/chat/completions", chat("next")))
+        status, _, body = read_response(s2)
+    assert status == 200 and json.loads(body)["choices"][0]["message"]["content"] == "next"
+    assert time.time() - t < 1.0
 
 
 def test_queue_full_gives_503(spawn):

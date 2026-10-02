@@ -6,23 +6,74 @@ A minimal HTTP/1.1 server in C11 that only serves the local machine. It includes
 
 - POSIX only (Linux, macOS, BSD). No dependencies beyond libc and pthreads.
 
-- 2,300 lines of C in `src/` plus 330 lines of headers. The demo server has 52 KB of code and runs in 2 MB RSS.
+- 4,900 lines of C in `src/` (1,900 in the core) plus 450 lines of headers. The demo server has 112 KB of code with every module (37 KB core only) and runs in 2 MB RSS.
 
 ## Scope
 
-spore can only listen on loopback (`127.0.0.1` or `::1`) or on a Unix socket. There is no address parameter, so the listener cannot be exposed by configuration.
+spore can only listen on loopback (`127.0.0.1` or `::1`) or on a Unix socket. There is no address parameter, so the listener cannot be bound elsewhere by configuration. A forwarder on the same host still exposes it: `ssh -L`, `socat` or a reverse proxy connects from loopback and passes the peer check. Then only the token authenticates remote clients. See [docs/dev/net-security.md](docs/dev/net-security.md).
 
 A local server's main attacker is a web page in the user's browser. So every request passes these checks before routing:
 
 | Check | Blocks |
 |---|---|
-| `Host` must be `localhost`, `*.localhost`, `127.0.0.1` or `[::1]` (TCP only) | DNS rebinding |
-| `Origin`, if present, must be a loopback origin or listed in `spore_config.origins` | cross-site requests (CSRF) |
+| `Host` must be `localhost`, `*.localhost`, `127.0.0.1`, `[::1]` or listed in `spore_config.hosts`. Checked on TCP, and on a Unix socket when `hosts` is set | DNS rebinding |
+| `Origin`, if present, must be listed in `spore_config.origins`, or be a loopback origin unless `origins_only` is set | cross-site requests (CSRF) |
 | Optional `Authorization: Bearer <token>`, compared in constant time | other local users and processes |
 | Unix socket peers must have the server's effective uid; the socket is mode `0600` | other local users |
 | TCP peers must have a loopback address | defence in depth |
 
 CORS preflights from allowed origins are answered automatically. TLS is not supported: loopback traffic never leaves the host.
+
+Loopback origins are allowed by default so a UI dev server on another port works without configuration. That also admits pages from every other local server. A deployment that knows its UI origin sets `origins_only` (`spored --origins-only --origin ...`).
+
+Which transport to use:
+
+| Client | Transport |
+|---|---|
+| Non-browser process on the host | Unix socket. The kernel checks the peer uid; a token adds nothing |
+| Browser | TCP with a token |
+| Anything behind a forwarder or proxy | TCP with a token |
+| Any client, single-user host, no forwarder | TCP without a token is acceptable. Any local process can connect |
+
+`spored --token-file PATH` generates a 32-byte token, writes it to `PATH` with mode `0600`, and prints `http://localhost:<port>/#token=<token>`. Browsers never send the fragment to a server, so it appears in no log or `Referer`. A page reads it and sends `Authorization: Bearer`. `spored --token T` still works, but other users can read `T` with `ps`.
+
+### Behind a reverse proxy
+
+The proxy passes the client's `Host` unchanged, and spore accepts the public name through `--host`. spore's Host check then still rejects DNS rebinding through the proxy. An nginx example:
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen 443 ssl;
+    server_name spore.example.com;
+    ssl_certificate     /etc/ssl/spore.pem;
+    ssl_certificate_key /etc/ssl/spore.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;      # stream SSE as it is produced
+        proxy_read_timeout 1h;    # long-lived WebSockets
+    }
+}
+```
+
+```sh
+spored --port 8080 --token-file ~/.spore-token \
+    --host spore.example.com --origins-only --origin https://spore.example.com
+```
+
+- **Require the token.** Every remote client arrives from the proxy's loopback address.
+
+- **Allow the public origin** with `--origin`. Browsers send `Origin` on POST requests and WebSocket upgrades, same-origin ones included. `--origins-only` drops the loopback origins, which mean nothing to a remote browser.
+
+- **Use TCP, not the Unix socket.** nginx runs as another user, so the uid check rejects it.
+
+The configuration has not been run against nginx in this repository's tests.
 
 ## Build and test
 
@@ -32,10 +83,10 @@ Modules are chosen at compile time. The core is always built. Each module adds o
 
 | Module | CMake option | Adds | Needs | `spored` code size |
 |---|---|---|---|---|
-| core | - | HTTP/1.1, access policy, static files, JSON | - | 33 KB |
+| core | - | HTTP/1.1, access policy, static files, JSON | - | 37 KB |
 | `ws` | `SPORE_WS` | WebSocket (`spore_ws.h`) | core | +17 KB |
-| `llm` | `SPORE_LLM` | OpenAI-compatible chat, completions, embeddings (`spore_llm.h`) | core | +21 KB |
-| `realtime` | `SPORE_REALTIME` | OpenAI Realtime API, speech to speech (`spore_realtime.h`) | `ws` | +37 KB |
+| `llm` | `SPORE_LLM` | OpenAI-compatible chat, completions, embeddings (`spore_llm.h`) | core | +23 KB |
+| `realtime` | `SPORE_REALTIME` | OpenAI Realtime API, speech to speech, `/v1/audio/speech` (`spore_realtime.h`) | `ws` | +43 KB |
 
 Tests for modules left out are skipped. `spored --modules` lists what was built.
 
@@ -45,7 +96,8 @@ make MODULES="ws"         # choose modules
 make test                 # ctest: unit tests, fuzz seed replay, pytest integration (needs uv)
 make asan tsan            # the same suites under sanitizers
 make check-modules        # build and test every module set
-make fuzz-run             # libFuzzer on the HTTP, JSON and WebSocket parsers (clang), FUZZ_TIME=60
+make fuzz-run             # libFuzzer: HTTP, JSON, WebSocket, realtime events (clang), FUZZ_TIME=60 each
+make autobahn             # Autobahn WebSocket testsuite against /ws/echo (Docker)
 make engines              # build/spored-engines with llama.cpp and whisper.cpp (LLAMA_DIR, WHISPER_DIR)
 make test-engines         # end-to-end with real models (MODELS=dir, ASR_SAMPLE=wav)
 make install PREFIX=...   # headers, libspore.a, CMake package
@@ -118,7 +170,7 @@ static void upgrade(spore_req *req, spore_resp *resp, void *ud) {
 }
 ```
 
-Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy.
+Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy. A send that would queue more than `spore_config.max_pending` bytes closes the connection instead.
 
 `/ws/duplex` shows the full-duplex pattern for speech in and audio out:
 
@@ -175,6 +227,8 @@ Supported:
 - `response.cancel`;
 
 - input transcription events.
+
+With a TTS stage, `spore_rt_new()` also serves `POST /v1/audio/speech`, OpenAI's text-to-speech endpoint. It returns 24 kHz mono 16-bit audio as `wav` (the default, sent whole) or `pcm` (raw samples, streamed as they are synthesized). The text is synthesized sentence by sentence; at most 4 requests run at once, and more get 503. `mp3`, `opus`, `aac`, `flac`, SSE streaming and `speed` other than 1 get 400. `voice` is passed to the engine, which may ignore it.
 
 Not supported yet: tools, G.711 formats, transcription-only sessions, out-of-band responses (`conversation: "none"`), and audio in `conversation.item.retrieved`. See [docs/dev/gaps.md](docs/dev/gaps.md).
 
@@ -256,7 +310,7 @@ A backend is a blocking function that pushes text through a callback. spore runs
 
 Sampling defaults follow llama-server: temperature 0.8, top_k 40, top_p 0.95, min_p 0.05.
 
-`backends/llama/` wraps llama.cpp in 230 lines of C++:
+`backends/llama/` wraps llama.cpp in 340 lines of C++:
 
 ```sh
 make engines
@@ -266,9 +320,21 @@ build/spored-engines --model bge-small-en-v1.5-q8_0.gguf --embedding --port 8081
 
 The official `openai` Python SDK passes against both (`tests/test_llm.py`, `tests/test_llama.py`).
 
-The backend keeps its KV cache between requests. It re-evaluates only the prompt suffix that differs from the previous request, and reports reused tokens in `usage.prompt_tokens_details.cached_tokens`. As in llama-server, cached and uncached runs can differ in their greedy output, because logits depend on batch shape. Send `"cache_prompt": false` for reproducible output.
+The backend keeps its KV cache between requests. It re-evaluates only the prompt suffix that is not already cached, and reports reused tokens in `usage.prompt_tokens_details.cached_tokens`. `spore_llama_config.n_slots` sets the number of cache slots. The library default is 1; `spored-engines` uses 4 (`--slots`). With several slots, interleaved conversations do not evict each other:
 
-Not supported: tool calls, images, `n > 1`, logprobs, reasoning-content separation, and batching across requests.
+- A request extends the slot with the longest shared prefix, when that discards at most one token.
+
+- Otherwise that prefix is copied into the least recently used slot. Copies share KV cells, so a common system prompt is stored once.
+
+- When the context is full, other slots are evicted, least recently used first.
+
+All slots share one `n_ctx`-sized KV buffer, and attention spans every cell in it. With three other slots holding about 2k tokens each, generation with Qwen3-0.6B on CPU drops from 67.6 to 58.0 tokens/s. `--slots 1` restores the single-cache behaviour. As in llama-server, cached and uncached runs can differ in their greedy output, because logits depend on batch shape. Send `"cache_prompt": false` for reproducible output.
+
+A leading `<think>` block in a chat reply, as Qwen3 emits, goes to `reasoning_content`, streamed or not. Send `"reasoning_format": "none"` for the raw text. Models whose chat template opens the block in the prompt, so the reply starts inside it, are not detected.
+
+A backend can reject a request with a message: `SPORE_LLM_INVALID` becomes a 400, `SPORE_LLM_ERROR` a 500, both with the backend's text. A streamed request gets the status too, because the stream head waits for the first event. The llama backend answers a prompt longer than the context with "the prompt has N tokens; the context holds M".
+
+Not supported: tool calls, images, `n > 1`, logprobs, and batching across requests.
 
 ## Limits
 
@@ -281,5 +347,6 @@ Defaults, all set in `spore_config`:
 | Request body | 8 MiB |
 | Idle keep-alive | 30 s |
 | Receive deadline per request | 30 s |
+| Unsent streamed output per response | 16 MiB; past it the connection closes |
 
-Chunked request bodies get 501, and absolute-form request targets get 400. `spore_serve_dir()` reads each file whole, so it suits UI assets, not large media. Design decisions are in [docs/dev/design.md](docs/dev/design.md). Known gaps are in [docs/dev/gaps.md](docs/dev/gaps.md).
+Chunked request bodies get 501, and absolute-form request targets get 400. A client that half-closes its connection (`shutdown(SHUT_WR)`) after sending requests still receives the responses. `spore_serve_dir()` reads each file whole, so it suits UI assets, not large media. Design decisions are in [docs/dev/design.md](docs/dev/design.md). Known gaps are in [docs/dev/gaps.md](docs/dev/gaps.md).
