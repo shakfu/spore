@@ -15,7 +15,7 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 - **No Windows support.** Porting needs `WSAPoll`, a socketpair in place of the self-pipe, and a peer-credential check for named pipes.
 
-- **No conditional or range requests.** Static files get no `ETag`, `If-Modified-Since` or `Range` handling.
+- **No conditional requests.** Static files get no `ETag` or `Last-Modified`, so `If-Range` always yields the whole file. Multiple ranges get the whole file.
 
 ## WebSockets
 
@@ -23,7 +23,7 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 - **No keep-alive pings.** On loopback and Unix sockets, the kernel closes a dead process's sockets, so a vanished peer is always seen. Pings would only detect a hung process, such as one stopped in a debugger. Browsers answer pings in their network stack, so a frozen tab would still pass.
 
-- **Send queue overflow closes.** A send past `spore_config.max_pending` closes the connection; there is no blocking send. Real-time producers should check `spore_ws_pending()` and drop frames first.
+- **Send queue overflow closes.** A send past `spore_config.max_pending` closes the connection; there is no blocking send. Producers should drop frames on `spore_ws_pending()`, or pause until `on_drain`.
 
 - **No extensions.** `permessage-deflate` is not offered. Compressed audio gains little from it.
 

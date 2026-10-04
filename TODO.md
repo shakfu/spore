@@ -26,7 +26,7 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md). 
 
 - [ ] Server-initiated WebSocket pings, to detect hung (not dead) local clients.
 
-- [ ] Stream static files instead of reading them whole; add `ETag` and `Range`.
+- [ ] Stream static files instead of reading them whole; add `ETag`.
 
 - [ ] Print embeddings at float32 precision (`%.9g`).
 
@@ -49,3 +49,11 @@ Detail and rationale for each item are in [docs/dev/gaps.md](docs/dev/gaps.md). 
 - [ ] `/v1/audio/speech`: `mp3` and `opus` output (OpenAI's default is `mp3`).
 
 - [ ] OuteTTS: keep accented letters; text is reduced to ASCII words.
+
+- [ ] Document JSON node growth beside `max_body`: each 32-byte `spore_jnode` can come from 2 input bytes (`[0,0,...]`), so an 8 MiB body can cost about 128 MiB of nodes.
+
+- [ ] Shrink a WebSocket response's `out` buffer after a burst; `flush()` keeps the peak allocation for the connection's lifetime.
+
+- [ ] Unmask WebSocket payloads 8 bytes at a time instead of one (`feed()` in `ws.c`).
+
+- [ ] Ignore a stray CRLF before the request line (RFC 9112 2.2); it now gets 400.

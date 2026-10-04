@@ -30,6 +30,11 @@ typedef struct {
      * sent if it closed first, 1005 if the peer sent none, or 1006 if the
      * connection dropped without a close. No callbacks follow. */
     void (*on_close)(spore_ws *ws, int code, void *ud);
+    /* Called once the send queue empties after it held at least
+     * `drain_at` bytes, so a producer that pauses at that mark can resume.
+     * Not called after closing starts; wait for on_close as well. */
+    void (*on_drain)(spore_ws *ws, void *ud);
+    size_t drain_at;    /* 64 KiB */
     size_t max_message; /* 1 MiB; larger messages close with 1009 */
     const char *protocol; /* subprotocol to select when the client offers it */
 } spore_ws_config;

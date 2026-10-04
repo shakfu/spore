@@ -1,4 +1,5 @@
 import os
+import resource
 import socket
 import subprocess
 import time
@@ -17,12 +18,16 @@ def requires(module):
 
 
 class Server:
-    def __init__(self, *args, tmp_path=None):
+    def __init__(self, *args, tmp_path=None, nofile=None):
+        def limit():  # in the child only: the test process keeps its limit
+            resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
+
         self.proc = subprocess.Popen(
             [SPORED, "--port", "0", *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            preexec_fn=limit if nofile else None,
         )
         line = self.proc.stdout.readline().strip()
         if not line.startswith("spored listening on "):
@@ -59,8 +64,8 @@ class Server:
 def spawn():
     servers = []
 
-    def make(*args):
-        s = Server(*args)
+    def make(*args, **kw):
+        s = Server(*args, **kw)
         servers.append(s)
         return s
 

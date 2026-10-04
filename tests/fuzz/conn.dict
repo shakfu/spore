@@ -16,3 +16,5 @@
 "/echo"
 "/stream"
 "/defer/"
+"0\x0d\x0a\x0d\x0a"
+";ext"

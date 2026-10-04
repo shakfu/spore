@@ -24,8 +24,9 @@ struct spore_ws {
     spore_resp *resp;      /* own reference */
     spore_ws_config cfg;
     void *ud;
-    atomic_int close_sent; /* our close frame is queued */
-    atomic_int close_code; /* code in it */
+    /* Code of our queued close frame, 0 before. One atomic, so the code is
+     * never seen unset once a close is. */
+    atomic_int close_code;
     atomic_int ended;      /* spore_end() called */
     /* loop thread only */
     int notified;
@@ -72,7 +73,7 @@ static int valid_close_code(int code) {
 
 int spore_ws_send(spore_ws *ws, int type, const void *data, size_t len) {
     if ((type != SPORE_WS_TEXT && type != SPORE_WS_BINARY) ||
-        atomic_load(&ws->close_sent))
+        atomic_load(&ws->close_code))
         return -1;
     return send_frame(ws, type == SPORE_WS_TEXT ? OP_TEXT : OP_BINARY, data,
                       len, 0);
@@ -81,8 +82,9 @@ int spore_ws_send(spore_ws *ws, int type, const void *data, size_t len) {
 int spore_ws_close(spore_ws *ws, int code, const char *reason) {
     size_t rl = reason ? strlen(reason) : 0;
     if (!valid_close_code(code) || rl > 123) return -1;
-    if (atomic_exchange(&ws->close_sent, 1)) return -1;
-    atomic_store(&ws->close_code, code);
+    int none = 0;
+    if (!atomic_compare_exchange_strong(&ws->close_code, &none, code))
+        return -1;
     unsigned char p[125] = {(unsigned char)(code >> 8), (unsigned char)code};
     if (rl) memcpy(p + 2, reason, rl);
     if (atomic_exchange(&ws->ended, 1)) return -1; /* connection gone */
@@ -94,7 +96,7 @@ int spore_ws_close(spore_ws *ws, int code, const char *reason) {
 size_t spore_ws_pending(spore_ws *ws) { return spore__pending(ws->resp); }
 
 void spore_ws_release(spore_ws *ws) {
-    if (!atomic_load(&ws->close_sent)) spore_ws_close(ws, 1000, NULL);
+    if (!atomic_load(&ws->close_code)) spore_ws_close(ws, 1000, NULL);
     unref(ws);
 }
 
@@ -148,7 +150,7 @@ static void on_close_frame(spore_ws *ws, const unsigned char *p, size_t len) {
 static long feed(void *ctx, char *data, size_t len) {
     spore_ws *ws = ctx;
     size_t off = 0;
-    while (!atomic_load(&ws->close_sent)) {
+    while (!atomic_load(&ws->close_code)) {
         const unsigned char *h = (const unsigned char *)data + off;
         size_t avail = len - off;
         if (avail < 2) break;
@@ -232,13 +234,22 @@ static long feed(void *ctx, char *data, size_t len) {
         }
     }
     /* Once closing, discard the rest: RFC 6455 ignores data after close. */
-    return atomic_load(&ws->close_sent) ? (long)len : (long)off;
+    return atomic_load(&ws->close_code) ? (long)len : (long)off;
 }
+
+static void drained(void *ctx) {
+    spore_ws *ws = ctx;
+    if (!ws->notified && !atomic_load(&ws->close_code) && ws->cfg.on_drain)
+        ws->cfg.on_drain(ws, ws->ud);
+}
+
+static void going_away(void *ctx) { spore_ws_close(ctx, 1001, NULL); }
 
 /* The connection is gone (or the server is being freed). */
 static void gone(void *ctx) {
     spore_ws *ws = ctx;
-    notify(ws, atomic_load(&ws->close_sent) ? atomic_load(&ws->close_code) : 1006);
+    int code = atomic_load(&ws->close_code);
+    notify(ws, code ? code : 1006);
     end_once(ws);
     unref(ws);
 }
@@ -302,11 +313,13 @@ spore_ws *spore_ws_accept(spore_req *req, spore_resp *resp,
     }
     if (cfg) ws->cfg = *cfg;
     if (!ws->cfg.max_message) ws->cfg.max_message = 1u << 20;
+    if (!ws->cfg.drain_at) ws->cfg.drain_at = 64u << 10;
     ws->ud = ud;
     ws->resp = resp;
     atomic_init(&ws->refs, 2);
     spore__resp_retain(resp);
-    spore__upgrade_hooks hooks = {feed, gone, ws};
+    spore__upgrade_hooks hooks = {feed, gone, ws, drained, going_away,
+                                  ws->cfg.on_drain ? ws->cfg.drain_at : 0};
     int rc = spore__upgrade(resp, h.ptr, &hooks, ws->cfg.max_message + MAX_HEADER);
     spore_buf_free(&h);
     if (rc) {

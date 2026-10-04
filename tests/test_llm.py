@@ -3,6 +3,7 @@
 import base64
 import http.client
 import json
+import signal
 import socket
 import struct
 import threading
@@ -329,13 +330,24 @@ def test_workers_run_in_parallel(spawn):
 
 
 def test_shutdown_during_generation_exits_cleanly(spawn):
-    srv = spawn()
+    srv = spawn("--grace-ms", "0")
     c = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=10)
     c.request("POST", "/v1/chat/completions", json.dumps(chat("slow:" + " w" * 100, stream=True)))
     c.getresponse().fp.readline()
     t = time.time()
     assert srv.stop() == 0
     assert time.time() - t < 2
+
+
+def test_shutdown_lets_streams_finish(spawn):
+    srv = spawn()
+    c = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=10)
+    c.request("POST", "/v1/chat/completions", json.dumps(chat("slow:" + " w" * 10, stream=True)))
+    r = c.getresponse()
+    srv.proc.send_signal(signal.SIGTERM)
+    body = r.read()
+    assert body.count(b'"content":" w"') == 10 and b"data: [DONE]" in body
+    assert srv.proc.wait(timeout=5) == 0
 
 
 def test_openai_sdk(srv):

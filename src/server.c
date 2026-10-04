@@ -34,6 +34,7 @@
 
 #define IN_INITIAL 4096
 #define DRAIN_MS 2000
+#define ACCEPT_BACKOFF_MS 100 /* listener unpolled after EMFILE and friends */
 
 enum { RS_NEW, RS_STREAM, RS_DONE };
 
@@ -48,6 +49,10 @@ struct spore_resp {
     int keep_alive;
     int chunked;
     size_t max_pending; /* 0: unbounded */
+    int status;         /* of the queued head, 0 before */
+    uint64_t sent;      /* bytes written to the socket */
+    size_t drain_at;    /* arm drain_armed at this many queued bytes */
+    int drain_armed;
     spore_buf hdrs; /* extra header lines, CRLF-terminated */
     spore_buf out;  /* bytes queued for the socket */
     size_t off;     /* bytes of `out` already sent */
@@ -69,6 +74,15 @@ typedef struct {
     spore_resp *resp;
     spore__upgrade_hooks up; /* set once upgraded: input goes to up.on_data */
     size_t up_max;           /* input buffer bound after the upgrade */
+    int drained;             /* output queue emptied after drain_armed */
+    int chunked;             /* body is chunked; `need` is 0 until decoded */
+    spore__chunked ck;
+    /* access log: method then target, copied when the head parsed */
+    int logging;
+    spore_buf lg;
+    size_t lg_mlen;
+    const char *why;
+    int64_t t_req;
 } conn;
 
 typedef struct {
@@ -95,6 +109,8 @@ struct spore_server {
     size_t n_conns;
     struct pollfd *pfds;
     conn *dispatching; /* connection whose handler is running */
+    int shutting;      /* spore_shutdown() is draining connections */
+    int64_t accept_at; /* listener unpolled until then */
 };
 
 /* Set while a thread runs spore_poll(); lets responses skip the wake-up
@@ -128,6 +144,7 @@ static const char *reason(int status) {
     case 200: return "OK";
     case 201: return "Created";
     case 204: return "No Content";
+    case 206: return "Partial Content";
     case 301: return "Moved Permanently";
     case 304: return "Not Modified";
     case 400: return "Bad Request";
@@ -138,6 +155,7 @@ static const char *reason(int status) {
     case 408: return "Request Timeout";
     case 413: return "Content Too Large";
     case 415: return "Unsupported Media Type";
+    case 416: return "Range Not Satisfiable";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
@@ -166,6 +184,7 @@ static void write_head(spore_resp *r, int status, const char *ctype,
                        long clen) {
     char date[32];
     http_date(date);
+    r->status = status;
     spore_buf *o = &r->out;
     spore_buf_printf(o, "HTTP/1.1 %d %s\r\nDate: %s\r\n", status,
                      reason(status), date);
@@ -274,6 +293,11 @@ static int overflow(spore_resp *r, size_t add) {
     return 1;
 }
 
+/* Caller holds r->mu. */
+static void arm_drain(spore_resp *r) {
+    if (r->drain_at && r->out.len - r->off >= r->drain_at) r->drain_armed = 1;
+}
+
 int spore_write(spore_resp *r, const void *data, size_t len) {
     pthread_mutex_lock(&r->mu);
     int ok = r->state == RS_STREAM && !r->closed && !r->out.err &&
@@ -282,6 +306,7 @@ int spore_write(spore_resp *r, const void *data, size_t len) {
         if (r->chunked) spore_buf_printf(&r->out, "%zx\r\n", len);
         spore_buf_add(&r->out, data, len);
         if (r->chunked) spore_buf_puts(&r->out, "\r\n");
+        arm_drain(r);
         if (r->srv) wake(r->srv);
     }
     pthread_mutex_unlock(&r->mu);
@@ -332,6 +357,7 @@ int spore__write2(spore_resp *r, const void *a, size_t alen, const void *b,
         spore_buf_add(&r->out, a, alen);
         spore_buf_add(&r->out, b, blen);
         if (r->chunked) spore_buf_puts(&r->out, "\r\n");
+        arm_drain(r);
         if (r->srv) wake(r->srv);
     }
     if (end && r->state != RS_DONE) {
@@ -401,6 +427,8 @@ int spore__upgrade(spore_resp *r, const char *extra,
     int ok = r->state == RS_NEW && !r->closed;
     if (ok) {
         spore_buf_puts(&r->out, "HTTP/1.1 101 Switching Protocols\r\n");
+        r->status = 101;
+        r->drain_at = hooks->drain_at;
         spore_buf_add(&r->out, r->hdrs.ptr, r->hdrs.len);
         if (extra) spore_buf_puts(&r->out, extra);
         spore_buf_puts(&r->out, "\r\n");
@@ -418,28 +446,56 @@ int spore__upgrade(spore_resp *r, const char *extra,
 
 /* ---- connections ------------------------------------------------------ */
 
+/* Start the access-log record of the request just parsed (req NULL if it
+ * did not parse). The spans are copied: the input buffer moves later. */
+static void log_begin(spore_server *s, conn *c, const spore_req *req,
+                      const char *why, int64_t now) {
+    if (!s->cfg.log) return;
+    c->logging = 1;
+    c->lg.len = 0;
+    c->lg_mlen = req ? req->method.len : 0;
+    if (req) {
+        spore_buf_add(&c->lg, req->method.ptr, req->method.len);
+        spore_buf_add(&c->lg, req->target.ptr, req->target.len);
+    }
+    c->why = why;
+    c->t_req = now;
+}
+
 /* The loop gives up its reference; the handler may still hold one. */
-static void detach(conn *c, int closed) {
+static void detach(spore_server *s, conn *c, int closed) {
     spore_resp *r = c->resp;
     if (!r) return;
     pthread_mutex_lock(&r->mu);
     r->srv = NULL;
     if (closed) r->closed = 1;
+    spore_access a = {.status = r->status, .bytes = r->sent,
+                      .aborted = r->state != RS_DONE || r->off < r->out.len,
+                      .reason = c->why};
     pthread_mutex_unlock(&r->mu);
     release(r);
     c->resp = NULL;
+    if (!c->logging) return;
+    c->logging = 0;
+    if (!c->lg.err) {
+        a.method = (spore_str){c->lg.ptr, c->lg_mlen};
+        a.target = (spore_str){c->lg.ptr + c->lg_mlen, c->lg.len - c->lg_mlen};
+    }
+    a.ms = now_ms() - c->t_req;
+    s->cfg.log(&a, s->cfg.log_ud);
 }
 
-static void conn_free(conn *c) {
-    detach(c, 1);
+static void conn_free(spore_server *s, conn *c) {
+    detach(s, c, 1);
     if (c->up.on_close) c->up.on_close(c->up.ctx);
     close(c->fd);
     free(c->in);
+    spore_buf_free(&c->lg);
     free(c);
 }
 
 static void conn_close(spore_server *s, size_t i) {
-    conn_free(s->conns[i]);
+    conn_free(s, s->conns[i]);
     s->conns[i] = s->conns[--s->n_conns];
 }
 
@@ -488,27 +544,58 @@ static int protocol_token(spore_str list, const char *tok, size_t tl) {
     return 0;
 }
 
+/* A browser request from another site that carries no Origin: a no-cors
+ * load such as <img> or <script>. Top-level and frame navigations by GET
+ * pass, so links to the local UI still work (Fetch Metadata's resource
+ * isolation policy). Non-browser clients send no Sec-Fetch-Site. */
+static int cross_site_load(const spore_req *req) {
+    if (!spore__ieq(spore_header_get(req, "Sec-Fetch-Site"), "cross-site"))
+        return 0;
+    spore_str dest = spore_header_get(req, "Sec-Fetch-Dest");
+    int nav = spore__ieq(spore_header_get(req, "Sec-Fetch-Mode"), "navigate") &&
+              (spore_str_eq(req->method, "GET") ||
+               spore_str_eq(req->method, "HEAD")) &&
+              !spore__ieq(dest, "object") && !spore__ieq(dest, "embed");
+    return !nav;
+}
+
+static int keep_alive(spore_server *s, const spore_req *req) {
+    return !s->shutting && req->minor >= 1 &&
+           !spore__has_token(spore_header_get(req, "Connection"), "close");
+}
+
 /* Access policy and framing. Returns 0 to dispatch, 1 if a reply was
- * queued, or an error status to send before closing. */
-static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
+ * queued, or an error status to send before closing; c->why names the
+ * check that answered. */
+static int check(spore_server *s, conn *c, spore_req *req, size_t *clen,
+                 int *chunked) {
     int check_host = !s->unix_path || s->cfg.hosts;
-    spore_str host = {0}, origin = {0}, cl = {0};
-    int n_host = 0, n_cl = 0;
+    spore_str host = {0}, origin = {0}, cl = {0}, te = {0};
+    int n_host = 0, n_cl = 0, n_te = 0;
     for (size_t i = 0; i < req->n_headers; i++) {
         spore_header *h = &req->headers[i];
         if (spore__ieq(h->name, "Host")) host = h->value, n_host++;
         else if (spore__ieq(h->name, "Origin")) origin = h->value;
         else if (spore__ieq(h->name, "Content-Length")) cl = h->value, n_cl++;
-        else if (spore__ieq(h->name, "Transfer-Encoding")) return 501;
+        else if (spore__ieq(h->name, "Transfer-Encoding")) te = h->value, n_te++;
     }
+    c->why = "host";
     if (n_host > 1 || (req->minor >= 1 && n_host == 0)) return 400;
     /* DNS rebinding: a hostile page reaches loopback under its own name. */
     if (check_host && n_host && !spore__host_allowed(host, s->cfg.hosts))
         return 403;
+    c->why = "origin";
     if (origin.ptr && !spore__origin_allowed(origin, s->cfg.origins,
                                              !s->cfg.origins_only))
         return 403;
+    if (!origin.ptr && cross_site_load(req)) return 403;
 
+    /* Only "chunked" alone; with Content-Length too the framing is
+     * ambiguous (RFC 9112 6.1), and HTTP/1.0 has no chunked coding. */
+    c->why = "framing";
+    if (n_te && (n_te > 1 || n_cl || req->minor < 1)) return 400;
+    if (n_te && !spore__ieq(te, "chunked")) return 501;
+    *chunked = n_te;
     if (n_cl > 1) return 400;
     size_t n = 0;
     for (size_t i = 0; i < cl.len; i++) {
@@ -517,11 +604,13 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
         n = n * 10 + (size_t)(cl.ptr[i] - '0');
     }
     if (n_cl && !cl.len) return 400;
+    c->why = "size";
     if (n > s->cfg.max_body) return 413;
     *clen = n;
+    c->why = NULL;
 
-    int keep = req->minor >= 1 &&
-               !spore__has_token(spore_header_get(req, "Connection"), "close");
+    /* A reply sent before an unread body closes: the body is not skipped. */
+    int keep = keep_alive(s, req) && !n && !n_te;
 
     spore_str acrm = spore_header_get(req, "Access-Control-Request-Method");
     if (origin.ptr && acrm.ptr && spore_str_eq(req->method, "OPTIONS")) {
@@ -534,7 +623,8 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
         if (acrh.len)
             spore_buf_printf(&h, "Access-Control-Allow-Headers: %.*s\r\n",
                              (int)acrh.len, acrh.ptr);
-        int rc = h.err ? -1 : simple_reply(s, c, req, 204, keep && !n, h.ptr);
+        c->why = "preflight";
+        int rc = h.err ? -1 : simple_reply(s, c, req, 204, keep, h.ptr);
         spore_buf_free(&h);
         return rc < 0 ? 500 : 1;
     }
@@ -548,7 +638,8 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
             ok = protocol_token(spore_header_get(req, "Sec-WebSocket-Protocol"),
                                 s->token, tl);
         if (!ok) {
-            if (simple_reply(s, c, req, 401, keep && !n,
+            c->why = "token";
+            if (simple_reply(s, c, req, 401, keep,
                              "WWW-Authenticate: Bearer\r\n") < 0)
                 return 500;
             return 1;
@@ -558,8 +649,7 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen) {
 }
 
 static void dispatch(spore_server *s, conn *c, spore_req *req) {
-    int keep = req->minor >= 1 &&
-               !spore__has_token(spore_header_get(req, "Connection"), "close");
+    int keep = keep_alive(s, req);
     int path_hit = 0;
     for (size_t i = 0; i < s->n_routes; i++) {
         route *rt = &s->routes[i];
@@ -580,6 +670,7 @@ static void dispatch(spore_server *s, conn *c, spore_req *req) {
                                : (spore_str){req->path.ptr + req->path.len, 0};
         spore_resp *r = resp_new(s, req, keep);
         if (!r) {
+            c->why = "memory";
             simple_reply(s, c, NULL, 500, 0, NULL);
             return;
         }
@@ -589,7 +680,30 @@ static void dispatch(spore_server *s, conn *c, spore_req *req) {
         s->dispatching = NULL;
         return;
     }
-    simple_reply(s, c, req, path_hit ? 405 : 404, keep, NULL);
+    c->why = "route";
+    if (!path_hit) {
+        simple_reply(s, c, req, 404, keep, NULL);
+        return;
+    }
+    /* 405 must list the methods the path has (RFC 9110 15.5.6). */
+    spore_buf allow = {0};
+    spore_buf_puts(&allow, "Allow:");
+    for (size_t i = 0; i < s->n_routes && !allow.err; i++) {
+        route *rt = &s->routes[i]; /* each has a method: NULL would match */
+        if (!(rt->prefix ? req->path.len >= rt->plen &&
+                               memcmp(req->path.ptr, rt->pattern, rt->plen) == 0
+                         : spore_str_eq(req->path, rt->pattern)))
+            continue;
+        for (int head = 0; head <= !strcmp(rt->method, "GET"); head++) {
+            const char *m = head ? "HEAD" : rt->method;
+            spore_str listed = {allow.ptr + 6, allow.len - 6};
+            if (!spore__has_token(listed, m))
+                spore_buf_printf(&allow, "%s %s", allow.len > 6 ? "," : "", m);
+        }
+    }
+    spore_buf_puts(&allow, "\r\n");
+    simple_reply(s, c, req, 405, keep, allow.err ? NULL : allow.ptr);
+    spore_buf_free(&allow);
 }
 
 /* Returns 1 when the response is complete and flushed, 0 if pending,
@@ -603,6 +717,7 @@ static int flush(conn *c, int64_t now) {
                          SEND_FLAGS);
         if (n > 0) {
             r->off += (size_t)n;
+            r->sent += (uint64_t)n;
             c->t_active = now;
         } else if (n < 0 && errno == EINTR) {
             continue;
@@ -615,6 +730,7 @@ static int flush(conn *c, int64_t now) {
     }
     if (r->off == r->out.len) {
         r->off = r->out.len = 0;
+        if (r->drain_armed) r->drain_armed = 0, c->drained = 1;
     } else if (r->off > 65536 && r->off > r->out.len / 2) {
         memmove(r->out.ptr, r->out.ptr + r->off, r->out.len - r->off);
         r->out.len -= r->off;
@@ -637,7 +753,11 @@ static int want_write(conn *c) {
 static size_t in_limit(spore_server *s, conn *c) {
     if (c->draining) return IN_INITIAL;
     if (c->up.on_data) return c->up_max;
-    return c->head_len ? c->need + 1 : s->cfg.max_header + 1;
+    if (!c->head_len) return s->cfg.max_header + 1;
+    /* Chunked: decoded body plus at most one undecoded line. */
+    if (c->chunked && !c->need)
+        return (size_t)c->head_len + c->ck.out + s->cfg.max_header + 2;
+    return c->need + 1;
 }
 
 static int grow_in(conn *c, size_t cap) {
@@ -678,14 +798,18 @@ static int conn_read(spore_server *s, conn *c, int64_t now) {
 }
 
 /* Upgraded connection: flush, hand input to the hook, flush its replies. */
-static int serve_upgraded(conn *c, int64_t now) {
+static int serve_upgraded(spore_server *s, conn *c, int64_t now) {
     for (int pass = 0; pass < 2; pass++) {
         int rc = flush(c, now);
         if (rc < 0) return -1;
         if (rc == 1) { /* protocol finished: close after the last byte */
-            detach(c, 0);
+            detach(s, c, 0);
             start_drain(c, now);
             return 0;
+        }
+        if (c->drained) {
+            c->drained = 0;
+            if (c->up.on_drain) c->up.on_drain(c->up.ctx);
         }
         if (pass || !c->in_len) return 0;
         long n = c->up.on_data(c->up.ctx, c->in, c->in_len);
@@ -696,18 +820,33 @@ static int serve_upgraded(conn *c, int64_t now) {
     return 0;
 }
 
+/* The input buffer moved since the head was parsed: re-point the spans. */
+static void reparse(spore_server *s, conn *c) {
+    size_t scan = 0;
+    spore__parse_head(c->in, c->in_len, s->cfg.max_header, &scan, &c->req);
+    c->base = c->in;
+}
+
+static void reset_request(conn *c) {
+    c->head_len = 0;
+    c->need = 0;
+    c->scan = 0;
+    c->chunked = 0;
+    memset(&c->ck, 0, sizeof c->ck);
+}
+
 static int conn_service(spore_server *s, conn *c, int64_t now) {
     for (;;) {
         if (c->up.on_data && c->resp) {
-            int rc = serve_upgraded(c, now);
+            int rc = serve_upgraded(s, c, now);
             return c->eof ? -1 : rc;
         }
         if (c->resp) {
             int rc = flush(c, now);
             if (rc < 0) return -1;
             if (rc == 0) return 0;
-            int keep = c->resp->keep_alive;
-            detach(c, 0);
+            int keep = c->resp->keep_alive && !s->shutting;
+            detach(s, c, 0);
             if (!keep) {
                 start_drain(c, now);
                 return 0;
@@ -728,10 +867,12 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
             long h = spore__parse_head(c->in, c->in_len, s->cfg.max_header,
                                        &c->scan, req);
             if (h == 0) break;
+            log_begin(s, c, h < 0 ? NULL : req, h < 0 ? "parse" : NULL, now);
             size_t clen = 0;
-            int st = h < 0 ? (int)-h : check(s, c, req, &clen);
+            int chunked = 0;
+            int st = h < 0 ? (int)-h : check(s, c, req, &clen, &chunked);
             if (st == 1) { /* reply queued; a body forces close + drain */
-                size_t used = clen ? c->in_len : (size_t)h;
+                size_t used = clen || chunked ? c->in_len : (size_t)h;
                 memmove(c->in, c->in + used, c->in_len - used);
                 c->in_len -= used;
                 c->scan = 0;
@@ -743,24 +884,38 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
                 continue;
             }
             c->head_len = h;
-            c->need = (size_t)h + clen;
+            c->chunked = chunked;
+            c->need = chunked ? 0 : (size_t)h + clen;
             /* Before grow_in(): its realloc leaves `req` pointing at freed memory. */
             int expect = spore__ieq(spore_header_get(req, "Expect"), "100-continue");
             c->base = c->in;
-            if (grow_in(c, c->need + 1)) return -1;
-            if (c->in_len < c->need && expect) {
+            if (!chunked && grow_in(c, c->need + 1)) return -1;
+            if (expect && (chunked ? c->in_len == (size_t)h : c->in_len < c->need)) {
                 static const char cont[] = "HTTP/1.1 100 Continue\r\n\r\n";
                 if (send(c->fd, cont, sizeof cont - 1, SEND_FLAGS) !=
                     (ssize_t)(sizeof cont - 1))
                     return -1;
             }
         }
+        if (c->chunked && !c->need) {
+            size_t len = c->in_len - (size_t)c->head_len;
+            int rc = spore__dechunk(&c->ck, c->in + c->head_len, &len,
+                                    s->cfg.max_body, s->cfg.max_header);
+            c->in_len = (size_t)c->head_len + len;
+            if (rc == 0) break;
+            if (c->base != c->in) reparse(s, c);
+            if (rc < 0) {
+                c->why = rc == -413 ? "size" : "framing";
+                if (simple_reply(s, c, req, -rc, 0, NULL) < 0) return -1;
+                reset_request(c);
+                continue;
+            }
+            c->need = (size_t)c->head_len + c->ck.out;
+            if (grow_in(c, c->need + 1)) return -1;
+        }
         if (c->in_len < c->need) break;
 
-        if (c->base != c->in) { /* buffer moved: re-point the spans */
-            size_t scan = 0;
-            spore__parse_head(c->in, c->in_len, s->cfg.max_header, &scan, req);
-        }
+        if (c->base != c->in) reparse(s, c);
         req->body = c->in + c->head_len;
         req->body_len = c->need - (size_t)c->head_len;
         char saved = c->in[c->need];
@@ -770,13 +925,13 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
 
         memmove(c->in, c->in + c->need, c->in_len - c->need);
         c->in_len -= c->need;
-        c->head_len = 0;
-        c->need = 0;
-        c->scan = 0;
+        reset_request(c);
     }
     if (!c->resp && !c->draining) {
         if (c->eof) return -1; /* no further request can arrive */
+        if (s->shutting && !c->t_start) return -1; /* idle */
         if (c->t_start && now - c->t_start > s->cfg.request_ms) {
+            log_begin(s, c, NULL, "timeout", now);
             if (simple_reply(s, c, NULL, 408, 0, NULL) < 0) return -1;
             return conn_service(s, c, now);
         }
@@ -841,7 +996,11 @@ static void accept_all(spore_server *s, int64_t now) {
         int fd = accept(s->lfd, (struct sockaddr *)&ss, &sl);
         if (fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
-            return; /* EAGAIN, or EMFILE and friends: retry next poll */
+            /* Out of descriptors or memory: the listener stays readable,
+             * so polling it again at once would spin. */
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                s->accept_at = now + ACCEPT_BACKOFF_MS;
+            return;
         }
         if (!peer_allowed(s, fd, &ss) || add_conn(s, fd, now) < 0) close(fd);
     }
@@ -865,8 +1024,10 @@ int spore_poll(spore_server *s, int timeout_ms) {
     size_t n = 2;
     int64_t next = INT64_MAX;
     s->pfds[0] = (struct pollfd){s->wake[0], POLLIN, 0};
-    s->pfds[1] = (struct pollfd){s->n_conns < s->cfg.max_conns ? s->lfd : -1,
-                                 POLLIN, 0};
+    int64_t now = now_ms();
+    int polled = s->n_conns < s->cfg.max_conns && now >= s->accept_at;
+    s->pfds[1] = (struct pollfd){polled ? s->lfd : -1, POLLIN, 0};
+    if (!polled && s->accept_at > now) next = s->accept_at;
     for (size_t i = 0; i < s->n_conns; i++) {
         conn *c = s->conns[i];
         short ev = 0;
@@ -878,7 +1039,7 @@ int spore_poll(spore_server *s, int timeout_ms) {
         if (d < next) next = d;
     }
     if (next != INT64_MAX) {
-        int64_t wait = next - now_ms();
+        int64_t wait = next - now;
         if (wait < 0) wait = 0;
         if (timeout_ms < 0 || wait < timeout_ms) timeout_ms = (int)wait;
     }
@@ -886,7 +1047,7 @@ int spore_poll(spore_server *s, int timeout_ms) {
         tl_loop = NULL;
         return -1;
     }
-    int64_t now = now_ms();
+    now = now_ms();
     if (s->pfds[0].revents & POLLIN) {
         /* Drain before clearing: the reverse order can swallow a byte
          * written after the clear, leaving wake_pending stuck at 1. */
@@ -925,6 +1086,27 @@ void spore_stop(spore_server *s) {
     atomic_store(&s->stop, 1);
     ssize_t n = write(s->wake[1], "", 1);
     (void)n;
+}
+
+int spore_shutdown(spore_server *s, int timeout_ms) {
+    int64_t end = now_ms() + (timeout_ms > 0 ? timeout_ms : 0);
+    if (s->lfd >= 0) { /* new clients are refused, not queued */
+        close(s->lfd);
+        s->lfd = -1;
+        if (s->unix_path) unlink(s->unix_path);
+    }
+    s->shutting = 1;
+    for (size_t i = 0; i < s->n_conns; i++) {
+        conn *c = s->conns[i];
+        if (c->up.on_shutdown && c->resp) c->up.on_shutdown(c->up.ctx);
+    }
+    /* The first pass closes idle connections. */
+    int64_t left = 0;
+    while (!atomic_load(&s->stop) && spore_poll(s, (int)left) == 0 &&
+           s->n_conns && (left = end - now_ms()) > 0) {
+    }
+    atomic_store(&s->stop, 0);
+    return s->n_conns ? 1 : 0;
 }
 
 /* ---- setup ------------------------------------------------------------ */
@@ -1010,11 +1192,20 @@ static int listen_unix(spore_server *s) {
         return -1;
     }
     strcpy(a.sun_path, s->unix_path);
-    struct stat st;
-    if (lstat(s->unix_path, &st) == 0 && S_ISSOCK(st.st_mode))
-        unlink(s->unix_path); /* stale socket from an earlier run */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    struct stat st;
+    if (lstat(s->unix_path, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        /* Replace a stale socket from an earlier run, not a live server's. */
+        if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+            close(fd);
+            errno = EADDRINUSE;
+            return -1;
+        }
+        if (errno == ECONNREFUSED) unlink(s->unix_path);
+        close(fd);
+        if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) return -1;
+    }
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0 ||
         chmod(s->unix_path, 0600) < 0) {
         int e = errno;
@@ -1057,7 +1248,7 @@ fail:;
 
 void spore_free(spore_server *s) {
     if (!s) return;
-    for (size_t i = 0; i < s->n_conns; i++) conn_free(s->conns[i]);
+    for (size_t i = 0; i < s->n_conns; i++) conn_free(s, s->conns[i]);
     if (s->lfd >= 0) {
         close(s->lfd);
         if (s->unix_path) unlink(s->unix_path);

@@ -121,6 +121,87 @@ static int hexval(unsigned char c) {
     return -1;
 }
 
+enum { CK_SIZE, CK_DATA, CK_CRLF, CK_TRAILER };
+
+/* No CR, LF or other control byte except HTAB: a bare LF in a chunk line
+ * is a known smuggling vector. */
+static int line_ok(const char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if ((c < 0x20 && c != '\t') || c == 0x7f) return 0;
+    }
+    return 1;
+}
+
+/* chunk-size [ BWS ";" chunk-ext ]; the extension is checked, then ignored */
+static int size_line(const char *p, size_t n, uint64_t *size, uint64_t max) {
+    size_t i = 0;
+    uint64_t v = 0;
+    for (; i < n && hexval((unsigned char)p[i]) >= 0; i++) {
+        v = v << 4 | (uint64_t)hexval((unsigned char)p[i]);
+        if (v > max) return -413;
+    }
+    if (!i) return -400;
+    while (i < n && (p[i] == ' ' || p[i] == '\t')) i++;
+    if (i < n && p[i] != ';') return -400;
+    if (!line_ok(p + i, n - i)) return -400;
+    *size = v;
+    return 0;
+}
+
+int spore__dechunk(spore__chunked *st, char *b, size_t *len, size_t max_body,
+                   size_t max_line) {
+    size_t w = st->out, r = st->out, n = *len;
+    int rc = 0;
+    while (!rc) {
+        if (st->state == CK_DATA) {
+            size_t k = n - r < st->left ? n - r : (size_t)st->left;
+            if (!k) break;
+            memmove(b + w, b + r, k);
+            w += k, r += k, st->left -= k;
+            if (!st->left) st->state = CK_CRLF;
+            continue;
+        }
+        if (st->state == CK_CRLF) {
+            if (n - r < 2) break;
+            if (b[r] != '\r' || b[r + 1] != '\n') rc = -400;
+            r += 2;
+            st->state = CK_SIZE;
+            continue;
+        }
+        const char *nl = memchr(b + r, '\n', n - r);
+        if (!nl) {
+            if (n - r > max_line) rc = -400;
+            break;
+        }
+        size_t ll = (size_t)(nl - (b + r));
+        if (!ll || b[r + ll - 1] != '\r' || ll > max_line) {
+            rc = -400;
+            break;
+        }
+        const char *line = b + r;
+        ll--; /* without CR */
+        r += ll + 2;
+        if (st->state == CK_SIZE) {
+            rc = size_line(line, ll, &st->left, max_body - w);
+            if (!rc) st->state = st->left ? CK_DATA : CK_TRAILER;
+        } else if (!ll) {
+            rc = 1;
+        } else { /* trailer field: checked like a header, then dropped */
+            size_t i = 0;
+            while (i < ll && is_tchar((unsigned char)line[i])) i++;
+            st->trailer += ll + 2;
+            if (!i || i == ll || line[i] != ':' || !line_ok(line, ll) ||
+                st->trailer > max_line)
+                rc = -400;
+        }
+    }
+    memmove(b + w, b + r, n - r);
+    *len = w + (n - r);
+    st->out = w;
+    return rc;
+}
+
 static long decode(const char *src, size_t len, char *dst, size_t cap,
                    int plus) {
     size_t o = 0;

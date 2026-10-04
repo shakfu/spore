@@ -52,6 +52,21 @@ typedef struct {
  * with spore_reply() or spore_end(), now or later from any thread. */
 typedef void (*spore_handler)(spore_req *req, spore_resp *resp, void *ud);
 
+/* One answered request, passed to spore_config.log on the loop thread once
+ * its response is sent or abandoned. Spans are valid only during the call. */
+typedef struct {
+    spore_str method;   /* empty if the request head did not parse */
+    spore_str target;
+    int status;         /* 0 if no response head was queued */
+    uint64_t bytes;     /* written to the socket, head included */
+    int64_t ms;         /* from the complete request head to the last byte */
+    int aborted;        /* the connection closed before the response ended */
+    /* Why the server answered instead of a handler, else NULL: "parse",
+     * "host", "origin", "framing", "size", "preflight", "token", "route",
+     * "timeout" or "memory". */
+    const char *reason;
+} spore_access;
+
 /* Zero fields take the default shown. */
 typedef struct {
     uint16_t port;              /* loopback TCP port; 0 picks a free one */
@@ -69,6 +84,8 @@ typedef struct {
     int idle_ms;                /* keep-alive idle timeout, 30000 */
     int request_ms;             /* deadline to receive a request, 30000 */
     size_t max_pending;         /* 16 MiB of unsent streamed output */
+    void (*log)(const spore_access *a, void *ud); /* access log, or NULL */
+    void *log_ud;
 } spore_config;
 
 /* Server lifecycle. spore_new() returns NULL and sets errno on failure. */
@@ -90,6 +107,14 @@ int spore_poll(spore_server *srv, int timeout_ms);
  * handler. */
 int spore_run(spore_server *srv);
 void spore_stop(spore_server *srv);
+
+/* Graceful stop, on the loop thread, typically after spore_run() returns.
+ * Closes the listener and idle connections, ends WebSockets with 1001, and
+ * runs the loop until in-flight requests finish or `timeout_ms` passes.
+ * No connection is kept alive afterwards. spore_stop() ends the wait early.
+ * Returns 0 once every connection has closed, or 1 at the deadline;
+ * spore_free() closes the rest. */
+int spore_shutdown(spore_server *srv, int timeout_ms);
 
 /* Request helpers. */
 spore_str spore_header_get(const spore_req *req, const char *name);
@@ -123,7 +148,10 @@ int spore_end(spore_resp *resp);
 int spore_closed(spore_resp *resp);
 
 /* Serve req->tail (or req->path for exact routes) from directory `root`.
- * GET and HEAD only; ".." segments are rejected; symlinks are followed. */
+ * GET and HEAD only; ".." segments are rejected; hidden files (any segment
+ * starting with '.') are 404; symlinks are followed.
+ * A single-range "Range: bytes=" request gets 206, or 416 if it starts
+ * past the end; multiple ranges and any If-Range get the whole file. */
 void spore_serve_dir(spore_req *req, spore_resp *resp, const char *root);
 const char *spore_mime(const char *path);
 

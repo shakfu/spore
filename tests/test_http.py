@@ -1,13 +1,15 @@
 """HTTP framing, access policy and static files, exercised over real sockets."""
 
 import os
+import re
+import signal
 import socket
 import stat
 import time
 
 import pytest
 
-from conftest import read_response, request
+from conftest import read_response, request, wait_for
 
 
 def get(path="/health", host="localhost", extra=""):
@@ -55,7 +57,34 @@ def test_http10_closes_and_needs_no_host(srv):
 
 def test_unknown_path_and_method(srv):
     assert request(srv, get("/missing"))[0] == 404
-    assert request(srv, b"DELETE /health HTTP/1.1\r\nHost: localhost\r\n\r\n")[0] == 405
+    status, h, _ = request(srv, b"DELETE /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert status == 405 and h["allow"] == "GET, HEAD"
+    status, h, _ = request(srv, get("/echo"))
+    assert status == 405 and h["allow"] == "POST"
+
+
+def test_accept_backs_off_when_out_of_descriptors(spawn):
+    # 16 descriptors fit about 10 connections. Before the backoff, the
+    # listener stayed readable while accept() failed with EMFILE: one core spun.
+    srv = spawn(nofile=16)
+    conns = [srv.connect() for _ in range(30)]
+    try:
+        time.sleep(0.2)
+        stat = f"/proc/{srv.proc.pid}/stat"
+        if not os.path.exists(stat):
+            pytest.skip("needs /proc")
+
+        def cpu():
+            f = open(stat).read().rsplit(")", 1)[1].split()
+            return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+
+        t0 = cpu()
+        time.sleep(1.0)
+        assert cpu() - t0 < 0.2
+    finally:
+        for c in conns:
+            c.close()
+    assert wait_for(lambda: request(srv, get())[0] == 200)  # recovers
 
 
 def test_head_has_length_but_no_body(srv):
@@ -74,7 +103,15 @@ def test_head_has_length_but_no_body(srv):
         (b"GET / HTTP/1.1\r\n\r\n", 400),  # missing Host
         (b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 400),
         (b"GET / HTTP/3.0\r\nHost: localhost\r\n\r\n", 505),
-        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n", 501),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5;a\nb\r\nhello\r\n0\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFFFF\r\n", 413),
         (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", 400),
         (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n", 400),
         (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999\r\n\r\n", 413),
@@ -137,6 +174,56 @@ def test_expect_100_continue(srv):
         assert read_response(s)[2] == b"hello"
 
 
+def chunked(body, size=7000):
+    out = b""
+    for i in range(0, len(body), size):
+        part = body[i : i + size]
+        out += f"{len(part):x};n={i}\r\n".encode() + part + b"\r\n"
+    return out + b"0\r\nX-Trailer: t\r\n\r\n"
+
+
+CHUNKED_POST = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n"
+
+
+def test_chunked_body_split_across_writes(srv):
+    body = os.urandom(300000)
+    raw = chunked(body)
+    with srv.connect() as s:
+        s.sendall(CHUNKED_POST + b"\r\n")
+        for i in range(0, len(raw), 4093):
+            s.sendall(raw[i : i + 4093])
+        s.sendall(get())  # pipelined after the body
+        status, h, got = read_response(s)
+        assert status == 200 and got == body
+        assert read_response(s)[0] == 200
+
+
+def test_chunked_expect_100_continue(srv):
+    with srv.connect() as s:
+        s.sendall(CHUNKED_POST + b"Expect: 100-continue\r\n\r\n")
+        assert s.recv(64) == b"HTTP/1.1 100 Continue\r\n\r\n"
+        s.sendall(b"5\r\nhello\r\n0\r\n\r\n")
+        assert read_response(s)[2] == b"hello"
+
+
+def test_chunked_body_over_limit_gets_413(srv):
+    # The second size line takes the body past the 8 MiB default.
+    with srv.connect() as s:
+        s.sendall(CHUNKED_POST + b"\r\n500000\r\n" + b"x" * 0x500000 + b"\r\n500000\r\n")
+        assert read_response(s)[0] == 413
+        assert closed_by_peer(s)
+
+
+def test_chunked_body_not_read_as_request_after_401(spawn):
+    srv = spawn("--token", "t")
+    inner = get()
+    with srv.connect() as s:
+        s.sendall(CHUNKED_POST + b"\r\n" + f"{len(inner):x}\r\n".encode() + inner + b"\r\n0\r\n\r\n")
+        status, h, _ = read_response(s)
+        assert status == 401 and h["connection"] == "close"
+        assert closed_by_peer(s)  # no second response
+
+
 def test_request_deadline_sends_408(spawn):
     srv = spawn("--request-ms", "300")
     with srv.connect() as s:
@@ -197,6 +284,26 @@ def test_loopback_hosts_accepted(srv, host):
 def test_foreign_hosts_rejected(srv, host):
     # DNS rebinding: the browser sends the attacker's name as Host.
     assert request(srv, get(host=host))[0] == 403
+
+
+@pytest.mark.parametrize(
+    "fetch,status",
+    [
+        ("Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: image\r\n", 403),
+        ("Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: object\r\n", 403),
+        ("Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\n", 200),
+        ("Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: iframe\r\n", 200),
+        ("Sec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: no-cors\r\n", 200),
+        ("Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\n", 200),
+    ],
+)
+def test_cross_site_loads_without_origin(srv, fetch, status):
+    assert request(srv, get(extra=fetch))[0] == status
+
+
+def test_cross_site_navigation_post_rejected(srv):
+    raw = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: navigate\r\nContent-Length: 0\r\n\r\n"
+    assert request(srv, raw)[0] == 403
 
 
 def test_cross_origin_rejected(srv):
@@ -284,6 +391,23 @@ def test_token_file(spawn, tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["token"]  # no temp file left
 
 
+def test_unix_socket_in_use_is_not_taken_over(spawn, tmp_path):
+    path = str(tmp_path / "spore.sock")
+    first = spawn("--unix", path)
+    with pytest.raises(RuntimeError):
+        spawn("--unix", path)
+    assert request(first, get(host="x"))[0] == 200
+
+
+def test_stale_unix_socket_replaced(spawn, tmp_path):
+    path = str(tmp_path / "spore.sock")
+    old = spawn("--unix", path)
+    old.proc.kill()  # no cleanup: the socket file stays
+    old.proc.wait()
+    assert os.path.exists(path)
+    assert request(spawn("--unix", path), get(host="x"))[0] == 200
+
+
 def test_unix_socket(spawn, tmp_path):
     path = str(tmp_path / "spore.sock")
     srv = spawn("--unix", path)
@@ -330,6 +454,10 @@ def site(tmp_path, spawn):
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "index.html").write_text("sub")
     (tmp_path / "a b.txt").write_text("spaced")
+    (tmp_path / ".env").write_text("SECRET=1")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]")
+    (tmp_path / "sub" / ".hidden").write_text("h")
     return spawn("--static", str(tmp_path))
 
 
@@ -341,10 +469,19 @@ def test_static_files(site):
     assert body == b"console.log(1)" and h["content-type"].startswith("text/javascript")
     assert request(site, get("/a%20b.txt"))[2] == b"spaced"
     assert request(site, get("/sub/"))[2] == b"sub"
+    assert h["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.parametrize("path", ["/.env", "/.git/config", "/.git/", "/sub/.hidden", "/%2eenv", "/./app.js"])
+def test_static_hidden_files_not_served(site, path):
+    assert request(site, get(path))[0] == 404
 
 
 def test_static_directory_redirect(site):
     status, h, _ = request(site, get("/sub"))
+    assert status == 301 and h["location"] == "/sub/"
+    # "//sub/" would be a scheme-relative URL to the host "sub".
+    status, h, _ = request(site, get("//sub"))
     assert status == 301 and h["location"] == "/sub/"
 
 
@@ -356,3 +493,138 @@ def test_static_traversal_rejected(site, path):
 def test_static_missing_and_api_routes_still_win(site):
     assert request(site, get("/nope.txt"))[0] == 404
     assert request(site, get("/health"))[2] == b'{"status":"ok"}'
+
+
+@pytest.fixture
+def media(tmp_path, spawn):
+    data = bytes(range(256)) * 4
+    (tmp_path / "a.bin").write_bytes(data)
+    (tmp_path / "empty.bin").write_bytes(b"")
+    return spawn("--static", str(tmp_path)), data
+
+
+@pytest.mark.parametrize(
+    "rng,first,last",
+    [
+        ("bytes=0-3", 0, 3),
+        ("bytes=1000-", 1000, 1023),
+        ("bytes=-24", 1000, 1023),
+        ("bytes=1020-5000", 1020, 1023),
+        ("bytes=-5000", 0, 1023),
+        ("BYTES=2-2", 2, 2),
+    ],
+)
+def test_static_range(media, rng, first, last):
+    srv, data = media
+    status, h, body = request(srv, get("/a.bin", extra=f"Range: {rng}\r\n"))
+    assert status == 206 and body == data[first : last + 1]
+    assert h["content-range"] == f"bytes {first}-{last}/1024"
+    assert h["accept-ranges"] == "bytes"
+
+
+@pytest.mark.parametrize("path,rng,size", [("/a.bin", "bytes=1024-", 1024), ("/a.bin", "bytes=-0", 1024), ("/empty.bin", "bytes=0-", 0)])
+def test_static_range_unsatisfiable(media, path, rng, size):
+    status, h, _ = request(media[0], get(path, extra=f"Range: {rng}\r\n"))
+    assert status == 416 and h["content-range"] == f"bytes */{size}"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "Range: bytes=0-1,5-6\r\n",  # several ranges: whole file is allowed
+        "Range: bytes=3-1\r\n",
+        "Range: items=0-1\r\n",
+        "Range: bytes=x-1\r\n",
+        'Range: bytes=0-1\r\nIf-Range: "v1"\r\n',  # no validators to match
+    ],
+)
+def test_static_range_ignored(media, extra):
+    srv, data = media
+    status, h, body = request(srv, get("/a.bin", extra=extra))
+    assert status == 200 and body == data and h["accept-ranges"] == "bytes"
+
+
+def test_static_head_range(media):
+    srv, _ = media
+    with srv.connect() as s:
+        s.sendall(b"HEAD /a.bin HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-3\r\n\r\n" + get())
+        status, h, _ = read_response(s, head_only=True)
+        assert status == 206 and h["content-length"] == "4"
+        assert read_response(s)[0] == 200  # no body bytes in between
+
+
+# ---- access log ------------------------------------------------------------
+
+
+def test_access_log(spawn):
+    srv = spawn("--log")
+    request(srv, get("/health"))
+    request(srv, get("/missing?q=1"))
+    request(srv, get("/health", host="evil.com"))
+    request(srv, b"GARBAGE\r\n\r\n")
+    request(srv, CHUNKED_POST + b"\r\n3\r\nabc\r\n0\r\n\r\n")
+    assert srv.stop() == 0
+    lines = srv.proc.stderr.read().splitlines()
+    pats = [
+        r"spored: GET /health 200 (\d+) \d+ms$",
+        r"spored: GET /missing\?q=1 404 \d+ \d+ms route$",
+        r"spored: GET /health 403 \d+ \d+ms host$",
+        r"spored:   400 \d+ \d+ms parse$",
+        r"spored: POST /echo 200 \d+ \d+ms$",
+    ]
+    assert len(lines) == len(pats), lines
+    for line, pat in zip(lines, pats):
+        assert re.match(pat, line), (line, pat)
+    assert int(re.match(pats[0], lines[0]).group(1)) > 15  # head + body
+
+
+# ---- graceful shutdown -------------------------------------------------------
+
+
+def test_shutdown_closes_idle_connections(srv):
+    with srv.connect() as s:
+        s.sendall(get())
+        read_response(s)
+        t = time.time()
+        srv.proc.send_signal(signal.SIGTERM)
+        assert closed_by_peer(s)
+        assert srv.proc.wait(timeout=5) == 0
+        assert time.time() - t < 1
+
+
+def test_shutdown_finishes_request_in_progress(srv):
+    with srv.connect() as s:
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: loc")
+        time.sleep(0.1)
+        srv.proc.send_signal(signal.SIGTERM)
+        time.sleep(0.2)
+        with pytest.raises(ConnectionRefusedError):
+            srv.connect()  # the listener is closed first
+        s.sendall(b"alhost\r\n\r\n")
+        status, h, _ = read_response(s)
+        assert status == 200 and h["connection"] == "close"
+        assert closed_by_peer(s)
+    assert srv.proc.wait(timeout=5) == 0
+
+
+def test_shutdown_deadline(spawn):
+    srv = spawn("--grace-ms", "300")
+    with srv.connect() as s:
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: loc")
+        time.sleep(0.1)
+        t = time.time()
+        srv.proc.send_signal(signal.SIGTERM)
+        assert srv.proc.wait(timeout=5) == 0
+        assert 0.25 < time.time() - t < 1.5
+
+
+def test_second_signal_ends_shutdown(srv):
+    with srv.connect() as s:
+        s.sendall(b"GET /health HTTP/1.1\r\nHost: loc")
+        time.sleep(0.1)
+        srv.proc.send_signal(signal.SIGTERM)
+        time.sleep(0.2)
+        t = time.time()
+        srv.proc.send_signal(signal.SIGTERM)
+        assert srv.proc.wait(timeout=5) == 0
+        assert time.time() - t < 1

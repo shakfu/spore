@@ -84,7 +84,35 @@ Initial release.
 
 - `spore_llm_backend.embed` returns `spore_llm_finish` and fills a `spore_llm_usage`, as `generate` does. Errors name their cause, and `SPORE_LLM_INVALID` gives 400. The llama backend reports an input over `n_batch` with both token counts; before, it was a bare 500. Empty inputs get 400.
 
+- Chunked request bodies (`Transfer-Encoding: chunked`) are decoded in place, within `max_body`. Before, they got 501, which turned away Node `fetch` with a stream body, `curl -T -` and Python generator bodies. Framing stays strict: `chunked` with `Content-Length`, on HTTP/1.0, or combined with another coding is rejected, as is a bare LF or control byte in a chunk line. A reply sent before the body is read (401, preflight) closes the connection, so the body is never parsed as a request.
+
+- `spore_shutdown(srv, timeout_ms)`: closes the listener and idle connections, sends WebSocket 1001, and runs the loop until in-flight requests finish or the deadline passes. `spored` calls it after a signal, so `SIGTERM` no longer exits at once: it waits up to `--grace-ms` (5000). A second signal ends the wait.
+
+- `spore_config.log`: one `spore_access` record per request (method, target, status, bytes, duration, aborted), with a `reason` when the core answered instead of a handler, such as `"host"` or `"token"`. `spored --log` prints them.
+
+- `spore_ws_config.on_drain`: called when the send queue empties after holding `drain_at` bytes (64 KiB), so a producer that must not drop frames can pause and resume. `/ws/stream?wait=1` demonstrates it.
+
+- `spore_serve_dir()` answers a single `Range: bytes=` request with 206 and reads only that range, or 416 past the end. Safari plays `<audio>` and `<video>` only from servers that do. Multiple ranges and any `If-Range` get the whole file, since there are no validators.
+
+- A request with `Sec-Fetch-Site: cross-site` and no `Origin` gets 403, unless it is a GET navigation. Browsers send no `Origin` on `<img>` and `<script>` loads, so another site could trigger GET requests without a token. Links to the local UI still work.
+
+- Static responses carry `X-Content-Type-Options: nosniff`.
+
 ### Fixed before release
+
+- `spore_serve_dir()` served hidden files: `.env` and `.git/config` reached any allowed client. Any path segment starting with `.` now gets 404.
+
+- A 405 had no `Allow` header, which RFC 9110 requires. It now lists the path's methods.
+
+- `accept()` failing with `EMFILE` left the listener readable, so the loop spun on one core until a descriptor freed. The listener is now unpolled for 100 ms after such a failure.
+
+- A directory redirect for `//dir` sent `Location: //dir/`, a scheme-relative URL to the host `dir`. Leading slashes are collapsed.
+
+- A Unix socket path held by a running server was unlinked and taken over. The path is now replaced only when `connect()` is refused.
+
+- `on_close` could report code 0 when the connection dropped while another thread was closing: the close flag and code were separate atomics. They are now one.
+
+- `spore_json_int()` converted values beyond `long` without a check, which is undefined behaviour where `long` is 32 bits.
 
 - Lost wake-up in the event loop. The loop cleared `wake_pending` before draining the wake pipe. A worker byte written between the two was drained, but the flag stayed set, so no later worker wrote again. Every cross-thread reply then waited for the 1 s poll cap. `test_no_lost_wakeups_under_streaming` measures the stall.
 

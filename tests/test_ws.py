@@ -5,6 +5,7 @@ import base64
 import contextlib
 import json
 import os
+import signal
 import socket
 import struct
 import threading
@@ -287,6 +288,26 @@ def test_slow_reader_makes_producer_drop(srv):
     assert got == summary["sent"]
 
 
+def test_slow_reader_makes_producer_wait_for_drain(srv):
+    # With wait=1 the producer pauses above 256 KiB queued until on_drain,
+    # so a slow reader gets every frame, in order, and none is dropped.
+    frames, size = 400, 65536
+    path = f"/ws/stream?frames={frames}&size={size}&max_pending=262144&wait=1"
+    got = 0
+    with websockets.connect(url(srv, path), max_size=None, max_queue=1) as ws:
+        time.sleep(1.0)
+        while True:
+            m = ws.recv(timeout=10)
+            if isinstance(m, str):
+                summary = json.loads(m)
+                break
+            assert m[0] == got & 0xFF
+            got += 1
+    assert got == frames
+    assert summary["sent"] == frames and summary["dropped"] == 0
+    assert summary["waits"] > 0
+
+
 def test_reader_that_stops_is_disconnected(srv):
     # 256 MiB offered, never dropped by the producer. The server queues at
     # most max_pending (16 MiB) and then closes, instead of growing.
@@ -386,3 +407,19 @@ def test_duplex_barge_in_discards_stale_output(srv):
         assert cancelled > 0
         assert len(before) + cancelled == 60  # nothing lost or duplicated
         assert all(m[-1] == ord("B") for m in after)  # no stale speech
+
+
+# ---- shutdown --------------------------------------------------------------
+
+
+def test_shutdown_closes_with_1001(spawn):
+    srv = spawn("--log")
+    with websockets.connect(url(srv, "/ws/echo")) as ws:
+        ws.send("x")
+        assert ws.recv() == "x"
+        srv.proc.send_signal(signal.SIGTERM)
+        with pytest.raises(ConnectionClosed):
+            ws.recv(timeout=5)
+        assert ws.close_code == 1001
+    assert srv.proc.wait(timeout=5) == 0
+    assert "spored: GET /ws/echo 101 " in srv.proc.stderr.read()

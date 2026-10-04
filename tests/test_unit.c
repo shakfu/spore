@@ -75,6 +75,60 @@ static void test_parse_head(void) {
     CHECK(parse(many, &r) == -431);
 }
 
+/* Decode `in` fed `step` bytes at a time, as reads would arrive. Returns
+ * the final status; the decoded body and what follows it go to `out`. */
+static int dechunk(const char *in, size_t step, size_t max_body, char *out,
+                   size_t *out_len, size_t *body_len) {
+    spore__chunked st = {0};
+    char buf[512];
+    size_t len = 0, fed = 0, n = strlen(in);
+    int rc = 0;
+    while (!rc && fed < n) {
+        size_t k = n - fed < step ? n - fed : step;
+        memcpy(buf + len, in + fed, k);
+        len += k, fed += k;
+        rc = spore__dechunk(&st, buf, &len, max_body, 64);
+    }
+    memcpy(buf + len, in + fed, n - fed); /* arrives after the body */
+    len += n - fed;
+    memcpy(out, buf, len);
+    *out_len = len;
+    *body_len = st.out;
+    return rc;
+}
+
+static void test_dechunk(void) {
+    const char *ok = "4;a=b\r\nWiki\r\n5 ;x\r\npedia\r\nE\r\n in\r\n\r\nchunks."
+                     "\r\n0\r\nX-T: v\r\n\r\nNEXT";
+    for (size_t step = 1; step <= strlen(ok); step++) {
+        char out[512];
+        size_t len, body;
+        CHECK(dechunk(ok, step, 1000, out, &len, &body) == 1);
+        CHECK(body == 23 && memcmp(out, "Wikipedia in\r\n\r\nchunks.", 23) == 0);
+        CHECK(len == 27 && memcmp(out + 23, "NEXT", 4) == 0); /* kept */
+    }
+    char out[512];
+    size_t len, body;
+    CHECK(dechunk("0\r\n\r\n", 1, 0, out, &len, &body) == 1 && body == 0);
+    CHECK(dechunk("3\r\nabc", 1, 1000, out, &len, &body) == 0); /* more */
+    CHECK(dechunk("5\r\nhello\r\n", 1, 4, out, &len, &body) == -413);
+    CHECK(dechunk("3\r\nabc\r\n2\r\n", 1, 4, out, &len, &body) == -413);
+    CHECK(dechunk("FFFFFFFFFFFFFFFFFFFF\r\n", 64, 1000, out, &len, &body) == -413);
+    CHECK(dechunk("3\nabc\r\n0\r\n\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("3;a\nb\r\nabc\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("3\r\nabcXX0\r\n\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("-1\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("3 x\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("0\r\nNoColon\r\n\r\n", 1, 1000, out, &len, &body) == -400);
+    CHECK(dechunk("0\r\nA: \x01\r\n\r\n", 1, 1000, out, &len, &body) == -400);
+    char longline[128];
+    memset(longline, ';', sizeof longline - 1);
+    longline[0] = '1';
+    longline[sizeof longline - 1] = '\0';
+    CHECK(dechunk(longline, 1, 1000, out, &len, &body) == -400); /* > 64 */
+}
+
 static void test_tokens_and_hosts(void) {
     CHECK(spore__has_token(S("keep-alive, Close"), "close"));
     CHECK(!spore__has_token(S("closed"), "close"));
@@ -325,6 +379,7 @@ static void test_unroute(void) {
 
 int main(void) {
     test_parse_head();
+    test_dechunk();
     test_unroute();
     test_tokens_and_hosts();
     test_url();

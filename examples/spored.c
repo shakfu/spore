@@ -40,6 +40,16 @@ static void on_signal(int sig) {
     spore_stop(g_srv);
 }
 
+static void on_access(const spore_access *a, void *ud) {
+    (void)ud;
+    fprintf(stderr, "spored: %.*s %.*s %d %llu %lldms%s%s%s\n", (int)a->method.len,
+            a->method.ptr ? a->method.ptr : "", (int)a->target.len,
+            a->target.ptr ? a->target.ptr : "", a->status,
+            (unsigned long long)a->bytes, (long long)a->ms,
+            a->aborted ? " aborted" : "", a->reason ? " " : "",
+            a->reason ? a->reason : "");
+}
+
 static void on_static(spore_req *req, spore_resp *resp, void *ud) {
     spore_serve_dir(req, resp, ud);
 }
@@ -80,22 +90,75 @@ static void on_ws_echo(spore_req *req, spore_resp *resp, void *ud) {
 
 /* A producer thread standing in for an audio source: `frames` binary
  * frames of `size` bytes, one every `interval_us`. While more than
- * `max_pending` bytes are queued, frames are dropped rather than queued. */
+ * `max_pending` bytes are queued, frames are dropped, or with `wait` the
+ * producer pauses until on_drain. */
 typedef struct {
     spore_ws *ws;
     long frames, size, interval_us, max_pending;
+    int wait;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int drained, closed;
+    int refs; /* thread + on_close */
 } stream_job;
+
+static void stream_unref(stream_job *j) {
+    pthread_mutex_lock(&j->mu);
+    int n = --j->refs;
+    pthread_mutex_unlock(&j->mu);
+    if (n) return;
+    pthread_cond_destroy(&j->cv);
+    pthread_mutex_destroy(&j->mu);
+    free(j);
+}
+
+static void stream_wake(stream_job *j, int closed) {
+    pthread_mutex_lock(&j->mu);
+    if (closed) j->closed = 1;
+    else j->drained = 1;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+static void stream_drain(spore_ws *ws, void *ud) {
+    (void)ws;
+    stream_wake(ud, 0);
+}
+
+static void stream_close(spore_ws *ws, int code, void *ud) {
+    (void)ws;
+    (void)code;
+    stream_wake(ud, 1);
+    stream_unref(ud);
+}
 
 static void *stream_thread(void *arg) {
     stream_job *j = arg;
     unsigned char *buf = malloc((size_t)j->size + 1);
-    long sent = 0, dropped = 0;
-    for (long i = 0; buf && i < j->frames; i++) {
+    long sent = 0, dropped = 0, waits = 0;
+    int gone = 0;
+    for (long i = 0; buf && !gone && i < j->frames; i++) {
         if (j->interval_us)
             nanosleep(&(struct timespec){j->interval_us / 1000000,
                                          (j->interval_us % 1000000) * 1000},
                       NULL);
-        if (j->max_pending && spore_ws_pending(j->ws) > (size_t)j->max_pending) {
+        int skip = 0;
+        /* Waiting at pending > max_pending = drain_at: a drain is due. */
+        while (!gone && j->max_pending &&
+               spore_ws_pending(j->ws) > (size_t)j->max_pending) {
+            if (!j->wait) {
+                skip = 1;
+                break;
+            }
+            pthread_mutex_lock(&j->mu);
+            while (!j->drained && !j->closed) pthread_cond_wait(&j->cv, &j->mu);
+            j->drained = 0;
+            gone = j->closed;
+            pthread_mutex_unlock(&j->mu);
+            waits++;
+        }
+        if (gone) break;
+        if (skip) {
             dropped++;
             continue;
         }
@@ -104,13 +167,16 @@ static void *stream_thread(void *arg) {
         sent++;
     }
     char summary[96];
-    int n = snprintf(summary, sizeof summary, "{\"sent\":%ld,\"dropped\":%ld}",
-                     sent, dropped);
+    int n = j->wait ? snprintf(summary, sizeof summary,
+                               "{\"sent\":%ld,\"dropped\":%ld,\"waits\":%ld}",
+                               sent, dropped, waits)
+                    : snprintf(summary, sizeof summary,
+                               "{\"sent\":%ld,\"dropped\":%ld}", sent, dropped);
     spore_ws_send(j->ws, SPORE_WS_TEXT, summary, (size_t)n);
     spore_ws_close(j->ws, 1000, "done");
     spore_ws_release(j->ws);
     free(buf);
-    free(j);
+    stream_unref(j);
     return NULL;
 }
 
@@ -274,7 +340,7 @@ static void on_ws_duplex(spore_req *req, spore_resp *resp, void *ud) {
 
 static void on_ws_stream(spore_req *req, spore_resp *resp, void *ud) {
     (void)ud;
-    stream_job *j = malloc(sizeof *j);
+    stream_job *j = calloc(1, sizeof *j);
     if (!j) {
         spore_reply(resp, 500, "text/plain", "oom\n", 4);
         return;
@@ -283,21 +349,28 @@ static void on_ws_stream(spore_req *req, spore_resp *resp, void *ud) {
     j->size = query_long(req, "size", 640); /* 20 ms of 16 kHz s16 mono */
     j->interval_us = query_long(req, "interval_us", 0);
     j->max_pending = query_long(req, "max_pending", 0);
+    j->wait = query_long(req, "wait", 0) != 0;
     if (j->frames < 0 || j->size < 0 || j->size > (1L << 20) ||
         j->interval_us < 0 || j->max_pending < 0) {
         free(j);
         spore_reply(resp, 400, "text/plain", "bad query\n", 10);
         return;
     }
-    /* The thread owns the only reference; on_close is not needed. */
-    if (!(j->ws = spore_ws_accept(req, resp, NULL, NULL))) {
+    pthread_mutex_init(&j->mu, NULL);
+    pthread_cond_init(&j->cv, NULL);
+    j->refs = 2;
+    spore_ws_config cfg = {.on_close = stream_close, .on_drain = stream_drain,
+                           .drain_at = (size_t)j->max_pending};
+    if (!(j->ws = spore_ws_accept(req, resp, &cfg, j))) {
+        pthread_cond_destroy(&j->cv);
+        pthread_mutex_destroy(&j->mu);
         free(j);
         return;
     }
     pthread_t t;
     if (pthread_create(&t, NULL, stream_thread, j)) {
+        j->refs = 1; /* no thread; on_close drops the last reference */
         spore_ws_release(j->ws);
-        free(j);
         return;
     }
     pthread_detach(t);
@@ -362,6 +435,8 @@ static void usage(void) {
             "  --modules       print the compiled-in modules and exit\n"
             "  --idle-ms N     keep-alive idle timeout (default 30000)\n"
             "  --request-ms N  deadline to receive a request (default 30000)\n"
+            "  --grace-ms N    on SIGINT/SIGTERM, wait this long for in-flight requests (default 5000)\n"
+            "  --log           print an access log line per request to stderr\n"
 #if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
             "  --gpu           offload every engine to the GPU (needs a GPU ggml build)\n"
 #endif
@@ -396,6 +471,7 @@ int main(int argc, char **argv) {
 #endif
     const char *static_dir = NULL, *origins[16] = {0}, *hosts[16] = {0};
     const char *token_file = NULL;
+    int grace_ms = 5000;
     size_t n_hosts = 0;
     char token[65];
     size_t n_origins = 0;
@@ -434,6 +510,8 @@ int main(int argc, char **argv) {
         }
         else if (ARG("--idle-ms")) cfg.idle_ms = atoi(v);
         else if (ARG("--request-ms")) cfg.request_ms = atoi(v);
+        else if (ARG("--grace-ms")) grace_ms = atoi(v);
+        else if (strcmp(a, "--log") == 0) cfg.log = on_access;
 #if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
         else if (strcmp(a, "--gpu") == 0) gpu = 1;
 #endif
@@ -562,6 +640,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
 
     int rc = spore_run(g_srv);
+    if (!rc) spore_shutdown(g_srv, grace_ms);
 #ifdef SPORE_WITH_LLM
     spore_llm_free(llm);
 #endif

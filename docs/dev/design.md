@@ -35,7 +35,7 @@ A reply sent while request-body bytes are still unread (413, 401 before the body
 | Input | Response | Reason |
 |---|---|---|
 | Bare LF line endings, obs-fold | 400 | Lenient parsing enables request smuggling |
-| `Transfer-Encoding` on requests | 501 | Clients spore targets send `Content-Length` |
+| `Transfer-Encoding` other than `chunked` alone; with `Content-Length`; on HTTP/1.0 | 501; 400; 400 | Only the framing RFC 9112 requires. A bare LF or control byte in a chunk line is 400, as in the head |
 | Absolute-form targets | 400 | RFC 9112 asks servers to accept them. Rejecting them stops a request line from overriding `Host` |
 | Duplicate `Content-Length` or `Host` | 400 | Ambiguous framing or authority |
 

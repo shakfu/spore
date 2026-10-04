@@ -29,14 +29,35 @@ void spore__unroute(spore_server *srv, void *ud);
 
 /* ---- connection upgrade (server.c) ----------------------------------- */
 
+/* Decode a chunked request body (RFC 9112 7.1) in place. b[0..st->out)
+ * holds the body decoded so far and b[st->out..*len) undecoded input. The
+ * undecoded rest moves down to b[st->out] and *len is updated. Returns 1
+ * once the last chunk and trailers are consumed (bytes after them stay at
+ * b[st->out..*len)), 0 for more input, -413 past `max_body`, or -400 on
+ * malformed input, including lines longer than `max_line`. */
+typedef struct {
+    int state;
+    size_t out;     /* decoded body bytes */
+    uint64_t left;  /* bytes left in the current chunk */
+    size_t trailer; /* trailer bytes so far */
+} spore__chunked;
+int spore__dechunk(spore__chunked *st, char *b, size_t *len, size_t max_body,
+                   size_t max_line);
+
 /* After an upgrade the connection stops parsing HTTP. on_data runs on the
  * loop thread with all buffered input and returns the bytes it consumed,
  * or -1 to drop the connection. on_close runs once when the connection is
- * gone, including during spore_free(). */
+ * gone, including during spore_free(). on_drain runs when the output queue
+ * empties after reaching `drain_at` bytes (0: never). on_shutdown runs at
+ * spore_shutdown() and should start a protocol close. Optional: on_drain,
+ * on_shutdown. */
 typedef struct {
     long (*on_data)(void *ctx, char *data, size_t len);
     void (*on_close)(void *ctx);
     void *ctx;
+    void (*on_drain)(void *ctx);
+    void (*on_shutdown)(void *ctx);
+    size_t drain_at;
 } spore__upgrade_hooks;
 
 /* From inside a handler, on the loop thread: send a 101 response with

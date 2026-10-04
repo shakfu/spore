@@ -18,6 +18,7 @@ A local server's main attacker is a web page in the user's browser. So every req
 |---|---|
 | `Host` must be `localhost`, `*.localhost`, `127.0.0.1`, `[::1]` or listed in `spore_config.hosts`. Checked on TCP, and on a Unix socket when `hosts` is set | DNS rebinding |
 | `Origin`, if present, must be listed in `spore_config.origins`, or be a loopback origin unless `origins_only` is set | cross-site requests (CSRF) |
+| Without `Origin`, `Sec-Fetch-Site: cross-site` is refused unless the request is a GET navigation | cross-site `<img>`/`<script>` loads, which send no `Origin` |
 | Optional `Authorization: Bearer <token>`, compared in constant time | other local users and processes |
 | Unix socket peers must have the server's effective uid; the socket is mode `0600` | other local users |
 | TCP peers must have a loopback address | defence in depth |
@@ -134,6 +135,7 @@ int main(void) {
     spore_server *srv = spore_new(&(spore_config){.port = 8080});
     spore_route(srv, "GET", "/hello", hello, NULL);
     spore_run(srv);          /* until spore_stop(), e.g. from a signal handler */
+    spore_shutdown(srv, 5000); /* finish in-flight requests, at most 5 s */
     spore_free(srv);
 }
 ```
@@ -170,7 +172,7 @@ static void upgrade(spore_req *req, spore_resp *resp, void *ud) {
 }
 ```
 
-Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy. A send that would queue more than `spore_config.max_pending` bytes closes the connection instead.
+Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy. A producer that must not drop can pause instead, and resume when `on_drain` reports the queue empty (`/ws/stream?wait=1`). A send that would queue more than `spore_config.max_pending` bytes closes the connection.
 
 `/ws/duplex` shows the full-duplex pattern for speech in and audio out:
 
@@ -349,4 +351,4 @@ Defaults, all set in `spore_config`:
 | Receive deadline per request | 30 s |
 | Unsent streamed output per response | 16 MiB; past it the connection closes |
 
-Chunked request bodies get 501, and absolute-form request targets get 400. A client that half-closes its connection (`shutdown(SHUT_WR)`) after sending requests still receives the responses. `spore_serve_dir()` reads each file whole, so it suits UI assets, not large media. Design decisions are in [docs/dev/design.md](docs/dev/design.md). Known gaps are in [docs/dev/gaps.md](docs/dev/gaps.md).
+Absolute-form request targets get 400. A client that half-closes its connection (`shutdown(SHUT_WR)`) after sending requests still receives the responses. `spore_serve_dir()` reads each file, or the requested `Range`, whole, so it suits UI assets and media clips, not large media. `spore_config.log` receives one record per request; `spored --log` prints them. Design decisions are in [docs/dev/design.md](docs/dev/design.md). Known gaps are in [docs/dev/gaps.md](docs/dev/gaps.md).

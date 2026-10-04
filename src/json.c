@@ -3,6 +3,7 @@
 #include "spore_json.h"
 #include "internal.h"
 
+#include <limits.h>
 #include <locale.h>
 #include <math.h>
 #include <stdio.h>
@@ -279,8 +280,9 @@ int spore_json_double(const spore_jnode *n, double *out) {
 
 int spore_json_int(const spore_jnode *n, long *out) {
     double d;
+    /* Exact doubles only (2^53), and within long: 32 bits on ILP32. */
     if (spore_json_double(n, &d) || d != floor(d) || d < -9.007199254740992e15 ||
-        d > 9.007199254740992e15)
+        d > 9.007199254740992e15 || d < (double)LONG_MIN || d > (double)LONG_MAX)
         return -1;
     *out = (long)d;
     return 0;
