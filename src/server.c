@@ -71,6 +71,7 @@ typedef struct {
     int eof;           /* peer shut its write side: no more input */
     int64_t t_start;   /* first byte of the pending request, 0 if none */
     int64_t t_active;  /* last I/O */
+    int64_t t_sent;    /* output pending and unsent since then; 0 if none */
     spore_resp *resp;
     spore__upgrade_hooks up; /* set once upgraded: input goes to up.on_data */
     size_t up_max;           /* input buffer bound after the upgrade */
@@ -598,14 +599,16 @@ static int check(spore_server *s, conn *c, spore_req *req, size_t *clen,
     *chunked = n_te;
     if (n_cl > 1) return 400;
     size_t n = 0;
+    int big = 0; /* past max_body; n stops growing so it cannot wrap */
     for (size_t i = 0; i < cl.len; i++) {
         if (cl.ptr[i] < '0' || cl.ptr[i] > '9') return 400;
-        if (n > s->cfg.max_body) break;
-        n = n * 10 + (size_t)(cl.ptr[i] - '0');
+        if (!big && (n > (SIZE_MAX - 9) / 10 ||
+                     (n = n * 10 + (size_t)(cl.ptr[i] - '0')) > s->cfg.max_body))
+            big = 1;
     }
     if (n_cl && !cl.len) return 400;
     c->why = "size";
-    if (n > s->cfg.max_body) return 413;
+    if (big) return 413;
     *clen = n;
     c->why = NULL;
 
@@ -708,7 +711,7 @@ static void dispatch(spore_server *s, conn *c, spore_req *req) {
 
 /* Returns 1 when the response is complete and flushed, 0 if pending,
  * -1 on a socket error. */
-static int flush(conn *c, int64_t now) {
+static int flush(conn *c, int64_t now, int idle_ms) {
     spore_resp *r = c->resp;
     int rc = 0;
     pthread_mutex_lock(&r->mu);
@@ -719,6 +722,7 @@ static int flush(conn *c, int64_t now) {
             r->off += (size_t)n;
             r->sent += (uint64_t)n;
             c->t_active = now;
+            c->t_sent = now;
         } else if (n < 0 && errno == EINTR) {
             continue;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -728,7 +732,9 @@ static int flush(conn *c, int64_t now) {
             break;
         }
     }
+    if (r->off < r->out.len && !c->t_sent) c->t_sent = now; /* stall starts */
     if (r->off == r->out.len) {
+        c->t_sent = 0;
         r->off = r->out.len = 0;
         if (r->drain_armed) r->drain_armed = 0, c->drained = 1;
     } else if (r->off > 65536 && r->off > r->out.len / 2) {
@@ -737,6 +743,7 @@ static int flush(conn *c, int64_t now) {
         r->off = 0;
     }
     if (r->out.err || r->closed) rc = -1; /* closed: overflow() */
+    if (c->t_sent && now - c->t_sent > idle_ms) rc = -1; /* peer stopped reading */
     if (!rc && r->state == RS_DONE && !r->out.len) rc = 1;
     pthread_mutex_unlock(&r->mu);
     return rc;
@@ -800,7 +807,7 @@ static int conn_read(spore_server *s, conn *c, int64_t now) {
 /* Upgraded connection: flush, hand input to the hook, flush its replies. */
 static int serve_upgraded(spore_server *s, conn *c, int64_t now) {
     for (int pass = 0; pass < 2; pass++) {
-        int rc = flush(c, now);
+        int rc = flush(c, now, s->cfg.idle_ms);
         if (rc < 0) return -1;
         if (rc == 1) { /* protocol finished: close after the last byte */
             detach(s, c, 0);
@@ -842,7 +849,7 @@ static int conn_service(spore_server *s, conn *c, int64_t now) {
             return c->eof ? -1 : rc;
         }
         if (c->resp) {
-            int rc = flush(c, now);
+            int rc = flush(c, now, s->cfg.idle_ms);
             if (rc < 0) return -1;
             if (rc == 0) return 0;
             int keep = c->resp->keep_alive && !s->shutting;
@@ -1014,7 +1021,7 @@ int spore__adopt(spore_server *s, int fd) {
 /* When conn_service() would next act on a timeout, or INT64_MAX. */
 static int64_t deadline(spore_server *s, conn *c) {
     if (c->draining) return c->t_active + DRAIN_MS + 1;
-    if (c->resp) return INT64_MAX;
+    if (c->resp) return c->t_sent ? c->t_sent + s->cfg.idle_ms + 1 : INT64_MAX;
     if (c->t_start) return c->t_start + s->cfg.request_ms + 1;
     return c->t_active + s->cfg.idle_ms + 1;
 }

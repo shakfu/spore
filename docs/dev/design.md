@@ -14,7 +14,7 @@ Loopback binding stops remote hosts. It does not stop a browser on the same host
 
 - **CSRF.** The page sends a cross-site `POST` with `Content-Type: text/plain`, which needs no preflight.
 
-Both checks run before routing. So no handler can forget them. The Host check is skipped for Unix sockets, because browsers cannot connect to them.
+Both checks run before routing. So no handler can forget them. The Host check is skipped for Unix sockets, because browsers cannot connect to them, unless `hosts` is set for a reverse proxy.
 
 ## `poll()` rather than epoll or kqueue
 
@@ -59,7 +59,7 @@ After sending a close frame, spore closes TCP once the frame is flushed and disc
 
 ## Realtime: a pipeline behind OpenAI's event protocol
 
-OpenAI's realtime models hear audio directly. spore has no such model, so a turn runs as transcribe, then generate, then synthesize. Each session has one worker thread that runs these steps in order, because the reply needs the transcript. A shared pool would need a per-session ordering mechanism; with at most `max_conns` sessions, a thread per session is simpler.
+OpenAI's realtime models hear audio directly. spore has no such model, so a turn runs as transcribe, then generate, then synthesize. Each session has one worker thread that runs these steps in order, because the reply needs the transcript. A shared pool would need a per-session ordering mechanism; with at most `max_conns` sessions, a thread per session is simpler. An audio response adds a speaker thread for its duration. Synthesis then runs outside the LLM callback, so it does not hold the LLM backend's lock: `spore_llama` serializes every generation behind one mutex.
 
 Both the loop thread (client events, VAD) and the worker send events and change session state, always under the session mutex. Barge-in sends `speech_started` and sets the response's cancel flag in one critical section. So `response.done` with `turn_detected` always follows `speech_started`, the order the spec requires.
 

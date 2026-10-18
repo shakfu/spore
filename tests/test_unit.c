@@ -4,12 +4,14 @@
 #include "spore_json.h"
 
 #include <locale.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures, checks;
@@ -226,7 +228,8 @@ static void test_json_read(void) {
 
     const char *bad[] = {"", "{", "[1,]", "{\"a\":1,}", "01", "1.", "-", ".5",
                          "\"a", "\"\x01\"", "\"\\x\"", "tru", "[1 2]",
-                         "{\"a\" 1}", "{1:2}", "1 1", "\"\\u12\"", "nul"};
+                         "{\"a\" 1}", "{1:2}", "1 1", "\"\\u12\"", "nul",
+                         "\"a\\u0000b\""};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         int rc = jparse(&d, bad[i], buf);
         if (rc == 0) fprintf(stderr, "accepted bad json: %s\n", bad[i]);
@@ -326,6 +329,146 @@ static void test_rt_audio(void) {
     spore__float_to_pcm16le(f, 3, pcm);
     CHECK(pcm[0] == 0xFF && pcm[1] == 0x7F && pcm[2] == 0x00 && pcm[3] == 0x80);
 }
+
+static int asr_mode, n_generate; /* asr_mode: 0 fails, 1 returns "" */
+
+static int asr_stub(void *self, const float *pcm, size_t n, spore_buf *out) {
+    (void)self, (void)pcm, (void)n;
+    spore_buf_puts(out, "");
+    return asr_mode ? 0 : -1;
+}
+
+static spore_llm_finish llm_stub(void *self, const spore_llm_params *p,
+                                 spore_llm_emit emit, void *ctx,
+                                 spore_llm_usage *u) {
+    (void)self, (void)p, (void)u;
+    n_generate++;
+    emit(ctx, "earlier", 7);
+    return SPORE_LLM_STOP;
+}
+
+static atomic_int gen_returned;
+static int tts_after_generate; /* synthesis ran after generate returned */
+
+static spore_llm_finish llm_sentences(void *self, const spore_llm_params *p,
+                                      spore_llm_emit emit, void *ctx,
+                                      spore_llm_usage *u) {
+    (void)self, (void)p, (void)u;
+    emit(ctx, "One. ", 5);
+    emit(ctx, "Two.", 4);
+    atomic_store(&gen_returned, 1);
+    return SPORE_LLM_STOP;
+}
+
+/* Waits up to 2 s for generate to return: synthesis must not block it. */
+static int tts_wait(void *self, const char *text, size_t len, const char *voice,
+                    spore_rt_emit_audio emit, void *ctx) {
+    (void)self, (void)text, (void)len, (void)voice;
+    for (int i = 0; i < 2000 && !atomic_load(&gen_returned); i++)
+        nanosleep(&(struct timespec){0, 1000000}, NULL);
+    tts_after_generate += atomic_load(&gen_returned);
+    static const float pcm[160];
+    return emit(ctx, pcm, 160) < 0;
+}
+
+/* Handle one event on a detached session; 1 if the server's output since
+ * the last call contains `want`. */
+static int rt_event(spore__rt_sess *s, const char *ev, const char *want) {
+    char *e = strdup(ev);
+    spore__rt_event(s, e, strlen(e));
+    free(e);
+    spore_buf out = {0};
+    spore__resp_take(spore__ws_resp(spore__rt_ws(s)), &out);
+    int hit = out.ptr && spore__find(out.ptr, out.len, want, strlen(want));
+    spore_buf_free(&out);
+    return hit;
+}
+
+static void test_rt_asr(void) {
+    static const char append[] = "{\"type\":\"input_audio_buffer.append\",\"audio\":\"AAAAAA==\"}";
+    static const char audio_item[] =
+        "{\"type\":\"conversation.item.create\",\"item\":{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_audio\",\"audio\":\"AAAAAA==\"}]}}";
+    static const char text_item[] =
+        "{\"type\":\"conversation.item.create\",\"item\":{\"type\":\"message\",\"role\":\"user\","
+        "\"content\":[{\"type\":\"input_text\",\"text\":\"earlier\"}]}}";
+    static const char respond[] =
+        "{\"type\":\"response.create\",\"response\":{\"output_modalities\":[\"text\"]}}";
+
+    /* No ASR: audio input is refused, transcripts are not. */
+    spore_rt_backend be = {.llm = {.model = "stub", .generate = llm_stub}};
+    spore_rt *rt = spore__rt_detached(&be, NULL);
+    spore__rt_sess *s = rt ? spore__rt_open(rt) : NULL;
+    CHECK(s != NULL);
+    if (!s) return;
+    rt_event(s, "{}", "");
+    CHECK(rt_event(s, append, "no speech recognition"));
+    CHECK(rt_event(s, audio_item, "no speech recognition"));
+    CHECK(rt_event(s, "{\"type\":\"conversation.item.create\",\"item\":{\"type\":\"message\","
+                      "\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"transcript\":\"hi\"}]}}",
+                   "conversation.item.added"));
+    spore__rt_close(s);
+    spore_rt_free(rt);
+
+    /* A failed or empty transcript is not answered from earlier context. */
+    be.asr = (spore_rt_asr){asr_stub, NULL, 16000};
+    rt = spore__rt_detached(&be, NULL);
+    for (asr_mode = 0; asr_mode < 2; asr_mode++) {
+        s = rt ? spore__rt_open(rt) : NULL;
+        CHECK(s != NULL);
+        if (!s) break;
+        n_generate = 0;
+        rt_event(s, text_item, "");
+        rt_event(s, audio_item, "");
+        CHECK(rt_event(s, respond, "\"status\":\"failed\""));
+        CHECK(n_generate == 0);
+        spore__rt_close(s);
+    }
+    spore_rt_free(rt);
+
+    /* Synthesis runs outside the LLM callback. */
+    spore_rt_backend sb = {.llm = {.model = "stub", .generate = llm_sentences},
+                           .tts = {tts_wait, NULL, 16000}};
+    spore_rt *srt = spore__rt_detached(&sb, NULL);
+    s = srt ? spore__rt_open(srt) : NULL;
+    CHECK(s != NULL);
+    if (s) {
+        rt_event(s, text_item, "");
+        CHECK(rt_event(s, "{\"type\":\"response.create\"}", "\"status\":\"completed\""));
+        CHECK(tts_after_generate == 2);
+        spore__rt_close(s);
+    }
+    spore_rt_free(srt);
+
+    /* Buffered plus item audio is bounded by max_input_s. */
+    rt = spore__rt_detached(&be, &(spore_rt_config){.max_input_s = 1});
+    s = rt ? spore__rt_open(rt) : NULL;
+    CHECK(s != NULL);
+    if (s) {
+        enum { HALF = 24000 / 2 * 2 * 6 / 5 }; /* 0.6 s of 24 kHz PCM16 */
+        unsigned char *pcm = calloc(1, HALF);
+        spore_buf ev = {0};
+        spore_buf_puts(&ev, "{\"type\":\"input_audio_buffer.append\",\"audio\":\"");
+        spore__base64(&ev, pcm, HALF);
+        spore_buf_puts(&ev, "\"}");
+        rt_event(s, "{\"type\":\"session.update\",\"session\":{\"type\":\"realtime\","
+                    "\"audio\":{\"input\":{\"turn_detection\":null}}}}", "");
+        CHECK(!rt_event(s, ev.ptr, "\"error\""));
+        ev.len = 0;
+        spore_buf_puts(&ev, "{\"type\":\"conversation.item.create\",\"item\":{\"type\":"
+                            "\"message\",\"role\":\"user\",\"content\":[{\"type\":"
+                            "\"input_audio\",\"audio\":\"");
+        spore__base64(&ev, pcm, HALF);
+        spore_buf_puts(&ev, "\"}]}}");
+        CHECK(rt_event(s, ev.ptr, "input audio limit"));
+        rt_event(s, "{\"type\":\"input_audio_buffer.clear\"}", "");
+        CHECK(!rt_event(s, ev.ptr, "input audio limit"));
+        spore_buf_free(&ev);
+        free(pcm);
+        spore__rt_close(s);
+    }
+    spore_rt_free(rt);
+}
 #endif
 
 static void reply_ud(spore_req *req, spore_resp *resp, void *ud) {
@@ -387,6 +530,7 @@ int main(void) {
     test_json_write();
 #ifdef SPORE_WITH_REALTIME
     test_rt_audio();
+    test_rt_asr();
 #endif
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures != 0;

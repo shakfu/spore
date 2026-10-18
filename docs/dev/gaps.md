@@ -7,6 +7,8 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 | Gap | Effect | Suggested fix |
 |---|---|---|
 | A closed TCP client is seen only on write | EOF is a half-close, so a TCP client that closes is noticed when a write fails. A non-streaming LLM reply keeps generating until it ends. Unix-socket peers raise `POLLHUP` and are noticed at once | None that keeps half-close: TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing |
+| Unix socket mode set after `bind` | Between `bind` and `chmod` the mode follows the umask; `chmod` follows a swapped-in symlink. The peer-uid check still applies | A `0177` umask around `bind`, but umask is process-wide and races other threads; `fchmod` before `bind` works on Linux only |
+| WebSocket token subprotocol without a selected protocol | A browser that offers only `openai-insecure-api-key.<tok>` passes auth, then fails the handshake, because no protocol is echoed | Offer the route's protocol too, as OpenAI's SDK does with `realtime` |
 | `POLLHUP` read as POSIX defines it | `POLLHUP` closes the connection: POSIX makes it exclusive with `POLLOUT`. If a platform raises it on a half-close alone, as macOS may, half-closed clients lose their responses there. Linux was tested; macOS was not | Test on macOS |
 
 ## HTTP server
@@ -36,6 +38,12 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 - **Not implemented:** tools and function calls, G.711 (`audio/pcmu`, `audio/pcma`), transcription-only sessions, out-of-band responses (`conversation: "none"`, `response.input`), `idle_timeout_ms`, input transcription deltas, and audio in `conversation.item.retrieved` (only lengths are stored).
 
 - **One content part per item.** Multi-part user messages are joined into one text.
+
+- **Unbounded conversation.** Item count and text per item have no cap, and `find_item` is a linear scan. A cap would end long sessions that are legitimate.
+
+- **VAD at the input cap.** While speech continues, the buffer is not trimmed. After `max_input_s` of continuous sound, every append is refused until the client commits or clears.
+
+- **`speech_stopped` can be skipped.** A `turn_detection` change, `input_audio_buffer.clear` or a manual commit during speech ends it without the event. Whether OpenAI sends it there is not verified.
 
 - **`/v1/audio/speech` encodes only WAV and raw PCM.** OpenAI's default, `mp3`, gets 400; so do `opus`, `aac` and `flac`. An omitted `response_format` gives WAV.
 
@@ -68,5 +76,11 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 - **Only a leading `<think>` block is separated.** A block opened by the chat template is detected only by a backend that emits the tag, as `spore_llama` does.
 
 - **Unsupported request features:** tool calls, image and audio content, `n > 1`, logprobs, token-array inputs to embeddings.
+
+- **Ignored sampling fields.** `presence_penalty`, `frequency_penalty`, `logit_bias` and embeddings `dimensions` are accepted and ignored. Clients send the penalties by default, so refusing them would break those clients.
+
+- **Error shape.** Error bodies carry an integer `code` and no `param`; OpenAI uses a string or null.
+
+- **Duplicate JSON keys: the first wins.** A proxy that parses with Python or JavaScript reads the last. Rejecting duplicates costs O(n^2) per object without a hash.
 
 - **Embeddings are printed with 17 digits.** Float vectors go out at double precision. That matches llama-server, but `%.9g` would round-trip float32 in about half the bytes. `encoding_format: "base64"` already avoids the cost.

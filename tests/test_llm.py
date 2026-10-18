@@ -187,6 +187,9 @@ def test_content_parts_joined(srv):
         (chat("x", stop=[1]), "stop"),
         (chat("x", cache_prompt="yes"), "cache_prompt"),
         (chat("x", tools=[{"type": "function"}]), "tools"),
+        (chat("x", stop=["\x00"]), "not valid JSON"),
+        (chat("x", response_format={"type": "json_object"}), "response_format"),
+        (chat("x", response_format="json"), "response_format"),
         ({"messages": [{"role": "user", "content": [{"type": "image_url"}]}]}, "text content"),
     ],
 )
@@ -195,6 +198,10 @@ def test_invalid_requests(srv, payload, needle):
     assert status == 400
     assert needle in r["error"]["message"]
     assert r["error"]["type"] == "invalid_request_error"
+
+
+def test_text_response_format_accepted(srv):
+    assert post(srv, "/v1/chat/completions", chat("x", response_format={"type": "text"}))[0] == 200
 
 
 def test_backend_error(srv):
@@ -234,6 +241,12 @@ def test_embeddings_reject_token_arrays(srv):
 def test_embeddings_reject_empty_input(srv, inp):
     status, r = post(srv, "/v1/embeddings", {"input": inp})
     assert status == 400 and "non-empty" in r["error"]["message"]
+
+
+def test_embeddings_input_count_capped(srv):
+    assert post(srv, "/v1/embeddings", {"input": ["a"] * 2048})[0] == 200
+    status, r = post(srv, "/v1/embeddings", {"input": ["a"] * 2049})
+    assert status == 400 and "2048" in r["error"]["message"]
 
 
 def test_embedding_error_names_cause(srv):

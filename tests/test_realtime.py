@@ -128,6 +128,10 @@ def test_session_update_merges(rt):
         ({"type": "realtime", "tools": [{"type": "function", "name": "f"}]}, "session.tools"),
         ({"type": "realtime", "audio": {"input": {"turn_detection": {"type": "server_vad", "threshold": 2}}}},
          "session.audio.input.turn_detection.threshold"),
+        ({"type": "realtime", "audio": {"input": {"turn_detection": {"type": "semantic_vad", "eagerness": "x"}}}},
+         "session.audio.input.turn_detection.eagerness"),
+        ({"type": "realtime", "audio": {"output": {"speed": 2}}}, "session.audio.output.speed"),
+        ({"type": "realtime", "audio": {"output": {"speed": "fast"}}}, "session.audio.output.speed"),
     ],
 )
 def test_session_update_rejections(rt, session, param):
@@ -310,6 +314,65 @@ def test_barge_in_cancels_before_response_done(rt):
     rt.append(silence(700))
     later = rt.until("response.done")  # the new turn's response
     assert all(e.get("response_id") != rid for e in later)
+
+
+def test_turn_ending_before_cancelled_response_done_is_answered(rt):
+    rt.text_item("slow " * 60)
+    rt.until("conversation.item.done")
+    rt.send(type="response.create")
+    rt.until("response.output_audio.delta")
+    rt.append(tone(300) + silence(700))  # the turn ends before the worker sees the cancel
+    evs = rt.until("input_audio_buffer.speech_stopped")
+    if "response.done" not in types(evs):
+        evs = rt.until("response.done")
+    assert evs[-1]["response"]["status"] == "cancelled"
+    evs = rt.until("response.done")
+    assert "response.created" in types(evs) and evs[-1]["response"]["status"] == "completed"
+    transcript = "".join(e["delta"] for e in evs if e["type"] == "response.output_audio_transcript.delta")
+    assert transcript.startswith("heard ")
+
+
+def test_turn_during_response_without_interrupt_is_answered_after_it(rt):
+    rt.send(type="session.update", session={"type": "realtime", "audio": {"input": {"turn_detection": {
+        "type": "server_vad", "interrupt_response": False}}}})
+    rt.until("session.updated")
+    rt.text_item("slow " * 60)
+    rt.until("conversation.item.done")
+    rt.send(type="response.create")
+    rt.until("response.output_audio.delta")
+    rt.append(tone(300) + silence(700))
+    evs = rt.until("response.done")
+    t = types(evs)
+    assert t.index("input_audio_buffer.speech_stopped") < t.index("response.done")
+    assert evs[-1]["response"]["status"] == "completed"
+    evs = rt.until("response.done")
+    assert "response.created" in types(evs) and evs[-1]["response"]["status"] == "completed"
+    transcript = "".join(e["delta"] for e in evs if e["type"] == "response.output_audio_transcript.delta")
+    assert transcript.startswith("heard ")
+
+
+def test_unpunctuated_text_spoken_in_bounded_pieces(rt):
+    text = " ".join(["word"] * 200)
+    rt.text_item(text)
+    rt.until("conversation.item.done")
+    rt.send(type="response.create")
+    evs = rt.until("response.done")
+    deltas = [e["delta"] for e in evs if e["type"] == "response.output_audio_transcript.delta"]
+    assert "".join(deltas) == text and max(map(len, deltas)) <= 401 and len(deltas) >= 3
+
+
+def test_truncate_during_response_survives_its_end(rt):
+    rt.text_item("slow " * 60)
+    rt.until("conversation.item.done")
+    rt.send(type="response.create")
+    item_id = rt.until("response.output_audio.delta")[-1]["item_id"]
+    rt.send(type="conversation.item.truncate", item_id=item_id, content_index=0, audio_end_ms=0)
+    evs = rt.until("response.done")
+    assert "conversation.item.truncated" in types(evs)
+    assert evs[-1]["response"]["status"] == "completed"
+    rt.send(type="conversation.item.retrieve", item_id=item_id)
+    item = rt.until("conversation.item.retrieved")[-1]["item"]
+    assert item["content"] == [{"type": "output_audio", "transcript": ""}] and item["status"] == "incomplete"
 
 
 def test_truncate_deletes_unheard_transcript(rt):

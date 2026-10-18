@@ -5,11 +5,12 @@ import re
 import signal
 import socket
 import stat
+import subprocess
 import time
 
 import pytest
 
-from conftest import read_response, request, wait_for
+from conftest import SPORED, read_response, request, wait_for
 
 
 def get(path="/health", host="localhost", extra=""):
@@ -115,6 +116,8 @@ def test_head_has_length_but_no_body(srv):
         (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", 400),
         (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n", 400),
         (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999\r\n\r\n", 413),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: " + b"9" * 40 + b"\r\n\r\n", 413),
+        (b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 99999999999x\r\n\r\n", 400),
     ],
 )
 def test_malformed_requests_rejected_and_closed(srv, raw, status):
@@ -241,6 +244,32 @@ def test_idle_connection_closed(spawn):
         assert closed_by_peer(s)
         # The poll wait ends at the deadline, not at a 1 s tick.
         assert 0.15 < time.time() - t < 0.6
+
+
+def test_stalled_reader_closed(tmp_path, spawn):
+    (tmp_path / "big.bin").write_bytes(bytes(32 << 20))
+    srv = spawn("--static", str(tmp_path), "--idle-ms", "300")
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.connect(("127.0.0.1", srv.port))
+    with s:
+        s.sendall(get("/big.bin"))
+        time.sleep(1.5)  # read nothing: queued output stalls
+        s.settimeout(5)
+        got = 0
+        while chunk := s.recv(1 << 20):
+            got += len(chunk)
+        assert got < 32 << 20  # closed before the whole file was sent
+
+
+@pytest.mark.parametrize("args,needle", [
+    (["--port", "70000"], "--port"),
+    (["--port", "80x"], "--port"),
+    (sum((["--origin", f"http://a{i}"] for i in range(16)), []), "--origin"),
+])
+def test_bad_flags_rejected(args, needle):
+    p = subprocess.run([SPORED, *args], capture_output=True, text=True, timeout=5)
+    assert p.returncode == 2 and needle in p.stderr
 
 
 def test_half_close_still_answered(srv):
@@ -451,6 +480,7 @@ def test_not_reachable_on_other_interfaces(srv):
 def site(tmp_path, spawn):
     (tmp_path / "index.html").write_text("<h1>home</h1>")
     (tmp_path / "app.js").write_text("console.log(1)")
+    (tmp_path / "UP.JS").write_text("1")
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "index.html").write_text("sub")
     (tmp_path / "a b.txt").write_text("spaced")
@@ -468,6 +498,7 @@ def test_static_files(site):
     status, h, body = request(site, get("/app.js"))
     assert body == b"console.log(1)" and h["content-type"].startswith("text/javascript")
     assert request(site, get("/a%20b.txt"))[2] == b"spaced"
+    assert request(site, get("/UP.JS"))[1]["content-type"].startswith("text/javascript")
     assert request(site, get("/sub/"))[2] == b"sub"
     assert h["x-content-type-options"] == "nosniff"
 
@@ -480,6 +511,7 @@ def test_static_hidden_files_not_served(site, path):
 def test_static_directory_redirect(site):
     status, h, _ = request(site, get("/sub"))
     assert status == 301 and h["location"] == "/sub/"
+    assert request(site, get("/sub?x=1"))[1]["location"] == "/sub/?x=1"
     # "//sub/" would be a scheme-relative URL to the host "sub".
     status, h, _ = request(site, get("//sub"))
     assert status == 301 and h["location"] == "/sub/"

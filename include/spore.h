@@ -81,7 +81,8 @@ typedef struct {
     size_t max_conns;           /* 64 */
     size_t max_header;          /* 8192 bytes */
     size_t max_body;            /* 8 MiB */
-    int idle_ms;                /* keep-alive idle timeout, 30000 */
+    int idle_ms;                /* keep-alive idle timeout, and the longest a
+                                   client may leave queued output unread; 30000 */
     int request_ms;             /* deadline to receive a request, 30000 */
     size_t max_pending;         /* 16 MiB of unsent streamed output */
     void (*log)(const spore_access *a, void *ud); /* access log, or NULL */

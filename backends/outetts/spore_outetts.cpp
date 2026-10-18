@@ -363,13 +363,17 @@ int synthesize(tts *t, const char *text, size_t len, spore_rt_emit_audio emit,
     size_t gi = 0;
     bool use_guide = true;
     int rc = 0;
+    bool ended = false; // false at the loop's end: the context filled mid-speech
     for (int n_past = (int)prompt.size(); n_past < n_ctx - 1; n_past++) {
         llama_token tok = llama_sampler_sample(smpl, t->cttc, -1);
         if (gi < guide.size() && use_guide && !llama_vocab_is_control(t->vocab, tok) &&
             !llama_vocab_is_eog(t->vocab, tok))
             tok = guide[gi++];
         use_guide = tok == t->newline;
-        if (llama_vocab_is_eog(t->vocab, tok)) break;
+        if (llama_vocab_is_eog(t->vocab, tok)) {
+            ended = true;
+            break;
+        }
         if (tok >= t->code_lo && tok <= t->code_hi) {
             st.codes.push_back(tok - t->code_lo);
             if ((rc = st.flush(false))) break;
@@ -384,7 +388,7 @@ int synthesize(tts *t, const char *text, size_t len, spore_rt_emit_audio emit,
         }
     }
     llama_sampler_free(smpl);
-    if (!rc) rc = st.flush(true);
+    if (!rc) rc = ended ? st.flush(true) : -1;
     return rc < 0 ? -1 : 0; /* 1: cancelled, not a failure */
 }
 

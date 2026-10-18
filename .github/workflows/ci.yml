@@ -7,6 +7,24 @@ on:
     - cron: "17 3 * * *"
 
 jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: make test
+      - run: make asan
+      # TSan needs setarch -R for its shadow mapping; Linux only here.
+      - if: runner.os == 'Linux'
+        run: make tsan
+      - if: runner.os == 'Linux'
+        run: make check-modules
+
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 75

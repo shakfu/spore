@@ -4,6 +4,7 @@
 #include "spore_json.h"
 #include "internal.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdatomic.h>
@@ -89,6 +90,12 @@ static void job_free(job *j) {
 }
 
 #define FAIL(m) do { *err = (m); return -1; } while (0)
+#define MAX_EMBED_INPUTS 2048 /* OpenAI's limit */
+#if LONG_MAX > 0xFFFFFFFF
+#define SEED_MAX 0xFFFFFFFFL
+#else
+#define SEED_MAX LONG_MAX /* ILP32: 0xFFFFFFFFL would be unsigned, and -1 as long */
+#endif
 
 static int get_num(job *j, const spore_jnode *o, const char *key,
                    double *out, double lo, double hi, const char **err) {
@@ -122,7 +129,7 @@ static int parse_sampling(job *j, const spore_jnode *o, const char **err) {
         get_int(j, o, "max_completion_tokens", &mt, -1, 1L << 30, err) ||
         get_int(j, o, "n_predict", &mt, -1, 1L << 30, err) ||
         get_int(j, o, "top_k", &tk, 0, 1L << 20, err) ||
-        get_int(j, o, "seed", &seed, -1, 0xFFFFFFFFL, err) ||
+        get_int(j, o, "seed", &seed, -1, SEED_MAX, err) ||
         get_int(j, o, "n", &n, 1, 1, err) ||
         get_num(j, o, "temperature", &p->temperature, 0, 100, err) ||
         get_num(j, o, "top_p", &p->top_p, 0, 1, err) ||
@@ -164,6 +171,13 @@ static int parse_sampling(job *j, const spore_jnode *o, const char **err) {
                                           !strcmp(rf->str, "deepseek") ||
                                           !strcmp(rf->str, "deepseek-legacy"))))
         FAIL("'reasoning_format' must be \"none\", \"auto\" or \"deepseek\"");
+
+    /* JSON mode and schemas are not enforced: refuse rather than return free text. */
+    const spore_jnode *fmt = spore_json_get(d, o, "response_format");
+    const spore_jnode *ft = spore_json_get(d, fmt, "type");
+    if (fmt && fmt->type != SPORE_JNULL &&
+        !(ft && ft->type == SPORE_JSTR && !strcmp(ft->str, "text")))
+        FAIL("only response_format type \"text\" is supported");
 
     const spore_jnode *tools = spore_json_get(d, o, "tools");
     if (tools && tools->type == SPORE_JARR && tools->len)
@@ -251,10 +265,12 @@ static int parse_embed(job *j, const spore_jnode *o, const char **err) {
     const spore_json *d = &j->doc;
     const spore_jnode *in = spore_json_get(d, o, "input");
     if (in && in->type == SPORE_JARR && in->len) {
+        size_t n = 0;
         for (const spore_jnode *e = spore_json_child(d, in); e;
-             e = spore_json_next(d, e))
+             e = spore_json_next(d, e), n++)
             if (e->type != SPORE_JSTR || !e->len)
                 FAIL("'input' must be a non-empty string or an array of them");
+        if (n > MAX_EMBED_INPUTS) FAIL("'input' has more than 2048 items");
     } else if (!in || in->type != SPORE_JSTR || !in->len) {
         FAIL("'input' must be a non-empty string or an array of them");
     }
@@ -475,6 +491,8 @@ static void run_generate(spore_llm *llm, job *j) {
 
     if (j->stream && failed && !g.begun && !g.dead) {
         reply_error(j->resp, status, msg);
+    } else if (j->stream && g.dead && !g.begun) {
+        reply_error(j->resp, 503, "the server is shutting down"); /* or the client left */
     } else if (j->stream) {
         if (g.dead) {
             /* client gone or shutting down: just close */
@@ -545,7 +563,7 @@ static void run_embed(spore_llm *llm, job *j) {
     const spore_jnode *e = j->input->type == SPORE_JARR
                                ? spore_json_child(d, j->input) : j->input;
     long tokens = 0;
-    for (size_t i = 0; e; i++, e = j->input->type == SPORE_JARR
+    for (size_t i = 0; e && !b.err; i++, e = j->input->type == SPORE_JARR
                                        ? spore_json_next(d, e) : NULL) {
         spore_llm_usage use = {0};
         spore_llm_finish f = SPORE_LLM_ERROR;

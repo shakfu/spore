@@ -53,6 +53,7 @@ typedef struct {
     int audio;            /* output modality */
     char *instructions;   /* override, or NULL */
     long max_tokens;      /* -1: "inf" */
+    int truncated;        /* the client truncated the item while active */
 } response;
 
 typedef struct job {
@@ -113,6 +114,8 @@ typedef struct spore__rt_sess {
     size_t n_items, cap_items;
     job *head, *tail;
     response *active;     /* queued or running response */
+    int respond_next;     /* a VAD turn ended while `active` was set */
+    size_t queued;        /* samples in transcription jobs; with `len`, at most max_input */
 } session;
 
 /* ---- ids and small helpers ---------------------------------------------- */
@@ -427,6 +430,7 @@ static void commit(session *s, uint64_t from, uint64_t to, char *item_id) {
     j->item_id = jid;
     j->pcm = pcm;
     j->n = n;
+    s->queued += n;
     push_job(s, j);
 }
 
@@ -492,7 +496,8 @@ static void vad(session *s) {
                 s->base = s->speech_start;
             }
             commit(s, s->base, end, id);
-            if (c->create_response) start_response(s, c->audio, NULL, c->max_tokens);
+            if (c->create_response && start_response(s, c->audio, NULL, c->max_tokens))
+                s->respond_next = s->active != NULL; /* answer it once `active` is done */
         }
     }
     /* While silent, keep only what a future prefix could need. */
@@ -604,7 +609,14 @@ static void on_session_update(ctx *c, const spore_jnode *ev) {
             ERR("invalid_value", "prefix_padding_ms must be 0..10000", "session.audio.input.turn_detection.prefix_padding_ms");
         if ((n = get(c, td, "silence_duration_ms")) && (spore_json_int(n, &silence) || silence < 10 || silence > 10000))
             ERR("invalid_value", "silence_duration_ms must be 10..10000", "session.audio.input.turn_detection.silence_duration_ms");
+        if ((n = get(c, td, "eagerness")) &&
+            !(is_str(n) && (!strcmp(n->str, "low") || !strcmp(n->str, "medium") ||
+                            !strcmp(n->str, "high") || !strcmp(n->str, "auto"))))
+            ERR("invalid_value", "eagerness must be low, medium, high or auto", "session.audio.input.turn_detection.eagerness");
     }
+    double speed = s->cfg.speed;
+    if ((n = get(c, out, "speed")) && (spore_json_double(n, &speed) || speed < 0.25 || speed > 1.5))
+        ERR("invalid_value", "speed must be in [0.25, 1.5]", "session.audio.output.speed");
 
     /* Apply. */
     config *cf = &s->cfg;
@@ -635,18 +647,19 @@ static void on_session_update(ctx *c, const spore_jnode *ev) {
     if (nr && is_null(nr)) set_str(&cf->noise, NULL);
     else if (is_str(n = get(c, nr, "type"))) set_str(&cf->noise, n->str);
     if (is_str(n = get(c, out, "voice"))) set_str(&cf->voice, n->str);
-    if ((n = get(c, out, "speed"))) spore_json_double(n, &cf->speed);
+    cf->speed = speed;
     send_session(s, "session.updated");
 }
 
 static void on_append(ctx *c, const spore_jnode *ev) {
     session *s = c->s;
     const spore_jnode *a = get(c, ev, "audio");
+    if (!s->rt->be.asr.fn) ERR("unsupported", "this server has no speech recognition", "audio");
     if (!is_str(a)) ERR("invalid_value", "'audio' must be a base64 string", "audio");
     long bytes = spore__base64_decode((char *)a->str, a->len);
     if (bytes < 0 || bytes % 2) ERR("invalid_value", "'audio' is not base64 16-bit PCM", "audio");
     size_t n = (size_t)bytes / 2;
-    if (s->len + n > s->rt->max_input)
+    if (s->len + s->queued + n > s->rt->max_input)
         ERR("input_audio_buffer_full", "input audio buffer is full; commit or clear it", NULL);
     if (s->len + n > s->cap) {
         size_t cap = s->cap ? s->cap : RATE;
@@ -751,6 +764,9 @@ static void on_item_create(ctx *c, const spore_jnode *ev) {
                 if (text.len) spore_buf_puts(&text, "\n");
                 spore_buf_add(&text, tr->str, tr->len);
                 has_text = 1;
+            } else if (is_str(au) && !s->rt->be.asr.fn) {
+                bad = "this server has no speech recognition";
+                break;
             } else if (is_str(au)) {
                 long bytes = spore__base64_decode((char *)au->str, au->len);
                 if (bytes < 0 || bytes % 2) {
@@ -758,6 +774,10 @@ static void on_item_create(ctx *c, const spore_jnode *ev) {
                     break;
                 }
                 npcm = (size_t)bytes / 2;
+                if (s->len + s->queued + npcm > s->rt->max_input) {
+                    bad = "input audio limit reached; wait for transcription";
+                    break;
+                }
                 pcm = malloc((npcm ? npcm : 1) * sizeof *pcm);
                 if (!pcm) {
                     bad = "out of memory";
@@ -802,6 +822,7 @@ static void on_item_create(ctx *c, const spore_jnode *ev) {
         j->item_id = jid;
         j->pcm = pcm;
         j->n = npcm;
+        s->queued += npcm;
         push_job(s, j);
     }
 }
@@ -852,6 +873,7 @@ static void on_item_truncate(ctx *c, const spore_jnode *ev) {
     it->audio = (size_t)end_ms * (RATE / 1000);
     set_str(&it->text, ""); /* unheard text must not stay in context */
     it->status = ST_INCOMPLETE;
+    if (s->active && !strcmp(s->active->item_id, it->id)) s->active->truncated = 1;
     spore_buf b = {0};
     ev_begin(&b, "conversation.item.truncated");
     spore_buf_puts(&b, ",\"item_id\":");
@@ -948,6 +970,7 @@ static void run_transcribe(session *s, job *j) {
         free(r);
     }
     pthread_mutex_lock(&s->mu);
+    s->queued -= j->n;
     long i = find_item(s, j->item_id);
     if (i >= 0 && ok) set_str(&s->items[i]->text, text.ptr ? text.ptr : "");
     if (i >= 0 && s->cfg.transcription) {
@@ -985,13 +1008,26 @@ typedef struct {
     size_t spoken;      /* audio mode: bytes handed to synthesis */
     spore_buf said;     /* audio mode: transcript actually sent */
     char *voice;
-    int failed;
+    atomic_int failed;
     spore_buf raw;      /* all generated text */
     spore__think th;    /* reasoning is neither sent nor spoken */
+    /* Audio mode: sentences for the speaker thread, so synthesis runs
+     * outside the LLM callback and its backend lock. */
+    pthread_mutex_t qmu;
+    pthread_cond_t qcv;
+    struct sentence *qhead, *qtail;
+    int qdone;
+    int threaded;       /* the speaker thread runs */
 } gen;
 
+typedef struct sentence {
+    struct sentence *next;
+    size_t n;
+    char t[];
+} sentence;
+
 static int stopped(gen *g) {
-    return atomic_load(&g->r->cancel) || g->s->closed;
+    return atomic_load(&g->r->cancel) || g->s->closed || atomic_load(&g->failed);
 }
 
 static void part_event(gen *g, const char *type, const char *field,
@@ -1026,7 +1062,7 @@ static int emit_audio(void *vg, const float *pcm, size_t n) {
     free(raw);
     if (!raw || b64.err) {
         spore_buf_free(&b64);
-        g->failed = 1;
+        atomic_store(&g->failed, 1);
         return 1;
     }
     pthread_mutex_lock(&g->s->mu);
@@ -1034,18 +1070,16 @@ static int emit_audio(void *vg, const float *pcm, size_t n) {
     if (!stop) {
         part_event(g, "response.output_audio.delta", "delta",
                    b64.ptr ? b64.ptr : "", b64.len);
-        g->it->audio += m;
+        if (!g->r->truncated) g->it->audio += m;
     }
     pthread_mutex_unlock(&g->s->mu);
     spore_buf_free(&b64);
     return stop;
 }
 
-/* Send the transcript for text[from, to), then synthesize it. */
-static void speak(gen *g, size_t from, size_t to) {
-    if (to <= from || stopped(g)) return;
-    const char *t = g->text.ptr + from;
-    size_t n = to - from;
+/* Send the transcript for t[0, n), then synthesize it. */
+static void speak(gen *g, const char *t, size_t n) {
+    if (!n || stopped(g)) return;
     pthread_mutex_lock(&g->s->mu);
     if (!stopped(g)) {
         part_event(g, "response.output_audio_transcript.delta", "delta", t, n);
@@ -1054,7 +1088,44 @@ static void speak(gen *g, size_t from, size_t to) {
     pthread_mutex_unlock(&g->s->mu);
     const spore_rt_backend *be = &g->s->rt->be;
     if (be->tts.fn(be->tts.self, t, n, g->voice, emit_audio, g) && !stopped(g))
-        g->failed = 1;
+        atomic_store(&g->failed, 1);
+}
+
+static void *speaker(void *vg) {
+    gen *g = vg;
+    for (;;) {
+        pthread_mutex_lock(&g->qmu);
+        while (!g->qhead && !g->qdone) pthread_cond_wait(&g->qcv, &g->qmu);
+        sentence *x = g->qhead;
+        if (x && !(g->qhead = x->next)) g->qtail = NULL;
+        pthread_mutex_unlock(&g->qmu);
+        if (!x) return NULL;
+        speak(g, x->t, x->n);
+        free(x);
+    }
+}
+
+/* Hand text[from, to) to the speaker thread, or speak it here without one. */
+static void queue_speech(gen *g, size_t from, size_t to) {
+    if (to <= from) return;
+    if (!g->threaded) {
+        speak(g, g->text.ptr + from, to - from);
+        return;
+    }
+    sentence *x = malloc(sizeof *x + (to - from));
+    if (!x) {
+        atomic_store(&g->failed, 1);
+        return;
+    }
+    x->next = NULL;
+    x->n = to - from;
+    memcpy(x->t, g->text.ptr + from, x->n);
+    pthread_mutex_lock(&g->qmu);
+    if (g->qtail) g->qtail->next = x;
+    else g->qhead = x;
+    g->qtail = x;
+    pthread_cond_signal(&g->qcv);
+    pthread_mutex_unlock(&g->qmu);
 }
 
 /* End of the next sentence in text[from, end), or 0 if none yet. */
@@ -1066,7 +1137,11 @@ static size_t sentence_end(const char *s, size_t from, size_t end) {
             i + 1 < end && (s[i + 1] == ' ' || s[i + 1] == '\n'))
             return i + 1;
     }
-    return end - from > 400 ? spore__utf8_cut(s, from, end) : 0;
+    if (end - from <= 400) return 0;
+    /* No punctuation: cut at the last space, so TTS input stays bounded. */
+    for (size_t i = from + 400; i > from; i--)
+        if (s[i] == ' ') return i + 1;
+    return spore__utf8_cut(s, from, from + 400);
 }
 
 static void keep_text(void *vg, int think, const char *p, size_t n) {
@@ -1096,7 +1171,7 @@ static int emit_text(void *vg, const char *text, size_t len) {
         while ((e = sentence_end(g->text.ptr, g->spoken, g->text.len)) > g->spoken) {
             size_t from = g->spoken;
             g->spoken = e;
-            speak(g, from, e);
+            queue_speech(g, from, e);
         }
     }
     return stopped(g);
@@ -1163,6 +1238,18 @@ static void send_response_event(session *s, const char *type, response *r,
     spore_buf_puts(&b, ",\"response\":");
     response_json(&b, s, r, status, detail_type, reason, out, u);
     ev_send(s, &b);
+}
+
+/* 1 if the latest message is user audio with no transcript: the LLM
+ * would answer the message before it. */
+static int unheard(session *s, const response *r) {
+    for (size_t i = s->n_items; i-- > 0;) {
+        const item *it = s->items[i];
+        if (it->role == ROLE_SYSTEM || !strcmp(it->id, r->item_id)) continue;
+        return it->role == ROLE_USER && it->ctype == C_INPUT_AUDIO &&
+               (!it->text || !*it->text);
+    }
+    return 0;
 }
 
 /* Messages for the LLM: instructions, then every item with text. */
@@ -1245,7 +1332,10 @@ static void run_response(session *s, response *r) {
             ? ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"audio\",\"transcript\":\"\"}"
             : ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"text\",\"text\":\"\"}");
         ev_send(s, &b);
-        msgs = build_messages(s, r, &n_msgs, &strings);
+        if (unheard(s, r))
+            snprintf(usage.error, sizeof usage.error, "the user's audio has no transcript");
+        else
+            msgs = build_messages(s, r, &n_msgs, &strings);
         g.voice = dup0(s->cfg.voice);
     } else if (it) {
         free(it->id);
@@ -1260,11 +1350,28 @@ static void run_response(session *s, response *r) {
                               .temperature = 0.8, .top_p = 0.95, .top_k = 40,
                               .min_p = 0.05, .seed = SPORE_LLM_SEED_RANDOM,
                               .cache_prompt = 1};
+        pthread_t spk;
+        if (r->audio) {
+            pthread_mutex_init(&g.qmu, NULL);
+            pthread_cond_init(&g.qcv, NULL);
+            g.threaded = !pthread_create(&spk, NULL, speaker, &g);
+        }
         fin = be->llm.generate(be->llm.self, &p, emit_text, &g, &usage);
         usage.error[sizeof usage.error - 1] = '\0';
         if (!g.raw.err) spore__think_advance(&g.th, g.raw.ptr, g.raw.len, 1, keep_text, &g);
         if (r->audio && !stopped(&g) && g.spoken < g.text.len)
-            speak(&g, g.spoken, g.text.len);
+            queue_speech(&g, g.spoken, g.text.len);
+        if (r->audio) {
+            if (g.threaded) {
+                pthread_mutex_lock(&g.qmu);
+                g.qdone = 1;
+                pthread_cond_signal(&g.qcv);
+                pthread_mutex_unlock(&g.qmu);
+                pthread_join(spk, NULL);
+            }
+            pthread_cond_destroy(&g.qcv);
+            pthread_mutex_destroy(&g.qmu);
+        }
         if (!r->audio && !stopped(&g) && g.sent < g.text.len) {
             pthread_mutex_lock(&s->mu);
             part_event(&g, "response.output_text.delta", "delta",
@@ -1283,19 +1390,22 @@ static void run_response(session *s, response *r) {
         status = dtype = "cancelled";
         reason = r->reason ? r->reason : "client_cancelled";
     } else if (!g.it || fin == SPORE_LLM_ERROR || fin == SPORE_LLM_INVALID ||
-               g.failed || g.text.err || g.raw.err) {
+               atomic_load(&g.failed) || g.text.err || g.raw.err) {
         status = dtype = "failed";
     } else if (fin == SPORE_LLM_LENGTH) {
         status = dtype = "incomplete";
         reason = "max_output_tokens";
     }
     if (g.it) {
-        /* The item keeps only what the client received. */
+        /* The item keeps only what the client received, or heard if it
+         * truncated the item. */
         const spore_buf *kept = r->audio ? &g.said : &g.text;
         size_t klen = r->audio ? g.said.len : g.sent;
-        free(g.it->text);
-        g.it->text = dupn(klen ? kept->ptr : "", klen);
-        g.it->status = strcmp(status, "completed") ? ST_INCOMPLETE : ST_COMPLETED;
+        if (!r->truncated) {
+            free(g.it->text);
+            g.it->text = dupn(klen ? kept->ptr : "", klen);
+            g.it->status = strcmp(status, "completed") ? ST_INCOMPLETE : ST_COMPLETED;
+        }
         const char *txt = g.it->text ? g.it->text : "";
         if (r->audio) {
             part_event(&g, "response.output_audio.done", NULL, NULL, 0);
@@ -1327,6 +1437,10 @@ static void run_response(session *s, response *r) {
     }
     send_response_event(s, "response.done", r, status, dtype, reason, g.it, &usage);
     s->active = NULL;
+    if (s->respond_next) {
+        s->respond_next = 0;
+        start_response(s, s->cfg.audio, NULL, s->cfg.max_tokens);
+    }
     pthread_mutex_unlock(&s->mu);
     spore_buf_free(&g.text);
     spore_buf_free(&g.raw);

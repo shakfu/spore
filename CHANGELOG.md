@@ -125,3 +125,31 @@ Initial release.
 - An absent query string was `{NULL, 0}`, so `spore_query_get()` computed `NULL + 0` (undefined behaviour). It is now an empty span at the end of the target. Found by `fuzz_http` under UBSan.
 
 - Heap use-after-free on a request whose body grows the input buffer. The `Expect` lookup ran after the realloc, through header spans into the freed buffer. A six-letter header name (`Accept`, `Origin`, `Cookie`) made the comparison read those bytes. Found by `fuzz_conn` in about 20 s.
+
+- A VAD turn that ended while a response was still active got no reply. The auto-response was refused as "already active" and the refusal was dropped. This happened after barge-in, when the turn ended before the cancelled response reached `response.done`, and always with `interrupt_response: false`. The response now starts once the active one is done.
+
+- `backends/llama` sized embeddings by `llama_model_n_embd()`, not by the pooled width `llama_model_n_embd_out()`. On a model where they differ, `/v1/embeddings` read past the vector. Reranker models (RANK pooling, which returns `n_cls_out` scores) are now refused at load.
+
+- Truncating the assistant item of a running response was undone when the response ended. The worker overwrote the item's text and status, so the transcript the client never played went back into the LLM context. The truncation now holds.
+
+- A NULL `asr.fn` did not refuse audio input, as `spore_realtime.h` states. `input_audio_buffer.append` and audio content in `conversation.item.create` are now refused. A response to user audio whose transcript failed or is empty now fails; before, the LLM answered the message before it.
+
+- CI runs `make test` and `make asan` on Linux and macOS, plus `make tsan` and `make check-modules` on Linux. Before, it ran only fuzzing and Autobahn.
+
+- A client that stopped reading held its queued output forever. Only streamed writes were capped by `max_pending`; a whole reply, such as a static file, was queued at any size with no timeout. A connection whose queued output makes no progress for `idle_ms` is now closed. `HEAD` on a static file no longer reads the file.
+
+- `/v1/embeddings` accepts at most 2048 inputs, OpenAI's limit. Before, any count was embedded under the backend lock, and the loop went on after the output buffer had failed.
+
+- Realtime audio waiting for transcription counts toward `max_input_s`, with the input buffer. `conversation.item.create` with audio bypassed the cap, so a client could queue audio faster than it was transcribed with no bound.
+
+- Realtime speech synthesis ran inside the LLM callback. With `spore_llama`, every sentence's synthesis held the backend mutex, so it blocked other sessions and `/v1/chat/completions`. An audio response now synthesizes on its own speaker thread. A synthesis failure now also stops generation; before, later sentences were still generated and spoken.
+
+- Text without punctuation went to TTS whole once it passed 400 bytes. OuteTTS then filled its context, stopped mid-text and reported success. Such text is now cut at the last space within 400 bytes, and OuteTTS reports a filled context as an error.
+
+- The JSON reader refuses `\u0000`. Strings are used as C strings, so a stop sequence of `"\u0000"` matched at once and ended generation, and message content was cut at the NUL.
+
+- `/v1/chat/completions` and `/v1/completions` refuse a `response_format` other than `text`, as they refuse tools. Before, JSON mode returned free text with 200. A streamed request that ends before its stream starts (shutdown, or a departed client) gets a JSON 503, not a bodiless 500. `seed` accepts its full range on 32-bit targets.
+
+- `session.update` validates `speed` (0.25 to 1.5) and `eagerness` (`low`, `medium`, `high`, `auto`) before applying anything.
+
+- Smaller fixes: a `Content-Length` with junk after a long digit run is 400, and the parse cannot wrap for any `max_body`. MIME types match the extension in any case. A directory redirect keeps the query string. `backends/llama` returns 400 for an empty prompt and warns at load if llama.cpp cannot apply the model's chat template. `spored` rejects an out-of-range `--port` and says why a 16th `--origin` or `--host` fails.

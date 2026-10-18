@@ -41,7 +41,7 @@ const char *spore_mime(const char *path) {
     const char *slash = strrchr(path, '/');
     if (dot && (!slash || dot > slash))
         for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
-            if (strcmp(dot + 1, map[i][0]) == 0) return map[i][1];
+            if (strcasecmp(dot + 1, map[i][0]) == 0) return map[i][1];
     return "application/octet-stream";
 }
 
@@ -133,6 +133,10 @@ static int serve(spore_req *req, spore_resp *resp, const char *root) {
             spore_buf loc = {0};
             spore_buf_add(&loc, p.ptr, p.len);
             spore_buf_puts(&loc, "/");
+            if (req->query.len) {
+                spore_buf_puts(&loc, "?");
+                spore_buf_add(&loc, req->query.ptr, req->query.len);
+            }
             int ok = !loc.err && !spore_set_header(resp, "Location", loc.ptr);
             spore_buf_free(&loc);
             if (!ok) return 500;
@@ -173,6 +177,11 @@ static int serve(spore_req *req, spore_resp *resp, const char *root) {
     /* Served files may be user content: no sniffing it into HTML. */
     spore_set_header(resp, "X-Content-Type-Options", "nosniff");
     size_t size = (size_t)(last + 1 - first);
+    if (spore_str_eq(req->method, "HEAD")) { /* the length is enough */
+        close(fd);
+        spore_reply(resp, status, spore_mime(path), NULL, size);
+        return 0;
+    }
     char *data = malloc(size ? size : 1);
     size_t got = 0;
     while (data && got < size) {

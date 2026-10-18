@@ -46,8 +46,9 @@ bool tokenize(const llama_vocab *vocab, const std::string &text, bool special,
               std::vector<llama_token> &out) {
     int n = -llama_tokenize(vocab, text.data(), (int32_t)text.size(), nullptr,
                             0, true, special);
-    if (n <= 0) return false;
+    if (n < 0) return false;
     out.resize((size_t)n);
+    if (!n) return true; // empty text, no BOS
     return llama_tokenize(vocab, text.data(), (int32_t)text.size(), out.data(),
                           n, true, special) == n;
 }
@@ -182,6 +183,7 @@ spore_llm_finish run(backend *b, const spore_llm_params *p, spore_llm_emit emit,
     std::vector<llama_token> toks;
     if (!tokenize(b->vocab, prompt, true, toks))
         return error(usage, SPORE_LLM_ERROR, "tokenization failed");
+    if (toks.empty()) return error(usage, SPORE_LLM_INVALID, "the prompt is empty");
     const int n_ctx = (int)llama_n_ctx(b->ctx);
     const int n_prompt = (int)toks.size();
     usage->prompt_tokens = n_prompt;
@@ -333,15 +335,27 @@ extern "C" spore_llm_backend *spore_llama_new(const spore_llama_config *cfg) {
             fprintf(stderr, "spore_llama: model has no pooling; cannot embed\n");
             throw 0;
         }
+        // RANK pooling returns n_cls_out scores, not an embedding.
+        if (cfg->embedding && llama_pooling_type(b->ctx) == LLAMA_POOLING_TYPE_RANK) {
+            fprintf(stderr, "spore_llama: model is a reranker; cannot embed\n");
+            throw 0;
+        }
 
         const char *slash = strrchr(cfg->model_path, '/');
         b->name = slash ? slash + 1 : cfg->model_path;
         b->be.model = b->name.c_str();
         if (cfg->embedding) {
             b->be.embed = embed;
-            b->be.embed_dim = (size_t)llama_model_n_embd(b->model);
+            b->be.embed_dim = (size_t)llama_model_n_embd_out(b->model); // pooled width
         } else {
             b->be.generate = generate;
+            // llama.cpp applies only its built-in templates; others fail per request.
+            llama_chat_message m = {"user", "x"};
+            char probe[256];
+            if (llama_chat_apply_template(llama_model_chat_template(b->model, nullptr), &m,
+                                          1, true, probe, sizeof probe) < 0)
+                fprintf(stderr, "spore_llama: chat template not supported; "
+                                "/v1/chat/completions will fail\n");
         }
         return &b->be;
     } catch (...) {

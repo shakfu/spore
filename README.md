@@ -6,7 +6,7 @@ A minimal HTTP/1.1 server in C11 that only serves the local machine. It includes
 
 - POSIX only (Linux, macOS, BSD). No dependencies beyond libc and pthreads.
 
-- 4,900 lines of C in `src/` (1,900 in the core) plus 450 lines of headers. The demo server has 112 KB of code with every module (37 KB core only) and runs in 2 MB RSS.
+- 5,400 lines of C in `src/` (2,200 in the core) plus 490 lines of headers. The demo server has 112 KB of code with every module (37 KB core only) and runs in 2 MB RSS.
 
 ## Scope
 

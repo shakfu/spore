@@ -416,6 +416,11 @@ static const char *const modules =
 #endif
     "";
 
+static void too_many(const char *flag) {
+    fprintf(stderr, "spored: at most 15 %s flags\n", flag);
+    exit(2);
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage: spored [options]\n"
@@ -491,14 +496,24 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
 #define ARG(name) (strcmp(a, name) == 0 && (v || (usage(), 0)) && ++i)
-        if (ARG("--port")) cfg.port = (uint16_t)atoi(v);
+        if (ARG("--port")) {
+            char *end;
+            long port = strtol(v, &end, 10);
+            if (*end || end == v || port < 0 || port > 65535) {
+                fprintf(stderr, "spored: --port must be 0..65535\n");
+                return 2;
+            }
+            cfg.port = (uint16_t)port;
+        }
         else if (strcmp(a, "--ipv6") == 0) cfg.ipv6 = 1;
         else if (ARG("--unix")) cfg.unix_path = v;
         else if (ARG("--token")) cfg.token = v;
         else if (ARG("--token-file")) token_file = v;
-        else if (ARG("--origin") && n_origins < 15) origins[n_origins++] = v;
+        else if (ARG("--origin") && (n_origins < 15 || (too_many("--origin"), 0)))
+            origins[n_origins++] = v;
         else if (strcmp(a, "--origins-only") == 0) cfg.origins_only = 1;
-        else if (ARG("--host") && n_hosts < 15) hosts[n_hosts++] = v;
+        else if (ARG("--host") && (n_hosts < 15 || (too_many("--host"), 0)))
+            hosts[n_hosts++] = v;
         else if (ARG("--static")) static_dir = v;
 #ifdef SPORE_WITH_LLM
         else if (ARG("--workers")) lcfg.workers = (size_t)atoi(v);

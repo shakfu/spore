@@ -27,7 +27,8 @@ typedef enum {
 /* Objects list their members as alternating key and value children. */
 typedef struct {
     spore_jtype type;
-    const char *str;  /* JSTR: decoded, NUL-terminated; JNUM: raw text */
+    const char *str;  /* JSTR: decoded, NUL-terminated, no inner NUL (\u0000
+                         is refused); JNUM: raw text */
     size_t len;       /* JSTR/JNUM: bytes; JARR: elements; JOBJ: members */
     uint32_t child;   /* index of first child, 0 if none */
     uint32_t next;    /* index of next sibling, 0 if none */
@@ -44,7 +45,8 @@ int spore_json_parse(spore_json *doc, char *text, size_t len);
 void spore_json_free(spore_json *doc);
 
 const spore_jnode *spore_json_root(const spore_json *doc);
-/* Object member by key, or NULL. `obj` may be NULL or a non-object. */
+/* Object member by key, or NULL. `obj` may be NULL or a non-object. With
+ * duplicate keys the first wins (Python and JavaScript keep the last). */
 const spore_jnode *spore_json_get(const spore_json *doc,
                                   const spore_jnode *obj, const char *key);
 /* First child and next sibling, or NULL. */

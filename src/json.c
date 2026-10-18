@@ -97,7 +97,7 @@ static long string(parser *ps) {
         case 't': *dst++ = '\t'; break;
         case 'u': {
             long cp = ps->end - src >= 4 ? hex4(src) : -1;
-            if (cp < 0) return -1;
+            if (cp <= 0) return -1; /* \u0000 would cut the C string short */
             src += 4;
             if (cp >= 0xD800 && cp <= 0xDBFF && ps->end - src >= 6 &&
                 src[0] == '\\' && src[1] == 'u') {
