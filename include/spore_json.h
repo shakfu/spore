@@ -59,8 +59,8 @@ int spore_json_double(const spore_jnode *node, double *out);
 int spore_json_int(const spore_jnode *node, long *out);  /* integral only */
 int spore_json_bool(const spore_jnode *node, int *out);
 
-/* Writer: append `s` as a quoted JSON string. Invalid UTF-8 becomes
- * U+FFFD, so the output is always valid JSON. */
+/* Writer: append `s` as a quoted JSON string. Invalid UTF-8 and NUL
+ * become U+FFFD, so the output is valid JSON that the reader accepts. */
 void spore_json_str(spore_buf *b, const char *s, size_t len);
 /* Append a number; NaN and infinities become null. */
 void spore_json_num(spore_buf *b, double v);

@@ -104,8 +104,15 @@ static void check_writers(const uint8_t *data, size_t size) {
     REQUIRE(spore_json_parse(&d, b.ptr, b.len) == 0);
     const spore_jnode *s = spore_json_root(&d);
     REQUIRE(s->type == SPORE_JSTR);
-    if (valid_utf8(data, size))
-        REQUIRE(s->len == size && memcmp(s->str, data, size) == 0);
+    if (valid_utf8(data, size)) { /* exact, except NUL -> U+FFFD */
+        spore_buf want = {0};
+        for (size_t i = 0; i < size; i++)
+            if (data[i]) spore_buf_add(&want, data + i, 1);
+            else spore_buf_add(&want, "\xEF\xBF\xBD", 3);
+        REQUIRE(!want.err && s->len == want.len &&
+                (!want.len || memcmp(s->str, want.ptr, want.len) == 0));
+        spore_buf_free(&want);
+    }
     spore_json_free(&d);
     spore_buf_free(&b);
 

@@ -146,7 +146,7 @@ Initial release.
 
 - Text without punctuation went to TTS whole once it passed 400 bytes. OuteTTS then filled its context, stopped mid-text and reported success. Such text is now cut at the last space within 400 bytes, and OuteTTS reports a filled context as an error.
 
-- The JSON reader refuses `\u0000`. Strings are used as C strings, so a stop sequence of `"\u0000"` matched at once and ended generation, and message content was cut at the NUL.
+- The JSON reader refuses `\u0000`. Strings are used as C strings, so a stop sequence of `"\u0000"` matched at once and ended generation, and message content was cut at the NUL. The writer now emits U+FFFD for a NUL byte, so the reader accepts all its output. Found by `fuzz_json` in CI.
 
 - `/v1/chat/completions` and `/v1/completions` refuse a `response_format` other than `text`, as they refuse tools. Before, JSON mode returned free text with 200. A streamed request that ends before its stream starts (shutdown, or a departed client) gets a JSON 503, not a bodiless 500. `seed` accepts its full range on 32-bit targets.
 

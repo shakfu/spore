@@ -1,5 +1,9 @@
 /* Unit tests for the parser, JSON and helpers. */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE /* INADDR_LOOPBACK, MSG_DONTWAIT */
+#else
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "internal.h"
 #include "spore_json.h"
 
@@ -253,6 +257,9 @@ static void test_json_write(void) {
     spore_json_str(&b, "a\"\\\n\x01\xc3\xa9\xff\xed\xa0\x80z", 12);
     CHECK(strcmp(b.ptr, "\"a\\\"\\\\\\n\\u0001\xc3\xa9\xef\xbf\xbd"
                         "\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbdz\"") == 0);
+    b.len = 0;
+    spore_json_str(&b, "a\0b", 3); /* NUL: the reader refuses \u0000 */
+    CHECK(strcmp(b.ptr, "\"a\xef\xbf\xbd" "b\"") == 0);
     b.len = 0;
     spore_json_num(&b, 0.7);
     spore_buf_puts(&b, ",");

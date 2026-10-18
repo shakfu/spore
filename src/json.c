@@ -356,6 +356,7 @@ void spore_json_str(spore_buf *b, const char *s, size_t len) {
                         : c == '\n' ? "\\n" : c == '\r' ? "\\r"
                         : c == '\t' ? "\\t" : NULL;
         if (esc) spore_buf_puts(b, esc);
+        else if (!c) spore_buf_add(b, "\xEF\xBF\xBD", 3); /* the reader refuses \u0000 */
         else spore_buf_printf(b, "\\u%04x", c);
         p++;
     }
