@@ -153,3 +153,5 @@ Initial release.
 - `session.update` validates `speed` (0.25 to 1.5) and `eagerness` (`low`, `medium`, `high`, `auto`) before applying anything.
 
 - Smaller fixes: a `Content-Length` with junk after a long digit run is 400, and the parse cannot wrap for any `max_body`. MIME types match the extension in any case. A directory redirect keeps the query string. `backends/llama` returns 400 for an empty prompt and warns at load if llama.cpp cannot apply the model's chat template. `spored` rejects an out-of-range `--port` and says why a 16th `--origin` or `--host` fails.
+
+- On macOS, a half-closed client got RST in place of its replies. macOS raises `POLLHUP` on a half-close, and the loop closed on `POLLHUP` with input unread. It now reads to EOF first; `POLLHUP` closes only once input is no longer polled. Found by the new macOS CI job, which also needed Unix socket paths under 104 bytes in the tests.

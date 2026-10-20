@@ -6,10 +6,9 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 
 | Gap | Effect | Suggested fix |
 |---|---|---|
-| A closed TCP client is seen only on write | EOF is a half-close, so a TCP client that closes is noticed when a write fails. A non-streaming LLM reply keeps generating until it ends. Unix-socket peers raise `POLLHUP` and are noticed at once | None that keeps half-close: TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing |
+| A closed TCP client is seen only on write | EOF is a half-close, so a TCP client that closes is noticed when a write fails. A non-streaming LLM reply keeps generating until it ends. On Linux, Unix-socket peers raise `POLLHUP` and are noticed at once; on macOS they are noticed like TCP | None that keeps half-close: TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing |
 | Unix socket mode set after `bind` | Between `bind` and `chmod` the mode follows the umask; `chmod` follows a swapped-in symlink. The peer-uid check still applies | A `0177` umask around `bind`, but umask is process-wide and races other threads; `fchmod` before `bind` works on Linux only |
 | WebSocket token subprotocol without a selected protocol | A browser that offers only `openai-insecure-api-key.<tok>` passes auth, then fails the handshake, because no protocol is echoed | Offer the route's protocol too, as OpenAI's SDK does with `realtime` |
-| `POLLHUP` read as POSIX defines it | `POLLHUP` closes the connection: POSIX makes it exclusive with `POLLOUT`. If a platform raises it on a half-close alone, as macOS may, half-closed clients lose their responses there. Linux was tested; macOS was not | Test on macOS |
 
 ## HTTP server
 

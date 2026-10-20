@@ -2,6 +2,7 @@ import os
 import resource
 import socket
 import subprocess
+import tempfile
 import time
 import weakref
 from pathlib import Path
@@ -78,6 +79,13 @@ def spawn():
 @pytest.fixture
 def srv(spawn):
     return spawn()
+
+
+@pytest.fixture
+def sock_path():
+    # sun_path holds 104 bytes on macOS; its tmp_path is longer.
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        yield os.path.join(d, "s.sock")
 
 
 _leftover = weakref.WeakKeyDictionary()  # bytes read past a response

@@ -289,10 +289,10 @@ def test_half_closed_client_gets_whole_reply(srv):
     assert json.loads(body)["choices"][0]["message"]["content"] == "slow: a b c"
 
 
-def test_hangup_with_full_input_buffer_cancels(spawn, tmp_path):
+def test_hangup_with_full_input_buffer_cancels(spawn, sock_path):
     # Input past the 8 KiB head limit stays unread while the reply is
     # pending. Closing a Unix socket raises POLLHUP, which must still cancel.
-    srv = spawn("--unix", str(tmp_path / "s.sock"), "--workers", "1")
+    srv = spawn("--unix", sock_path, "--workers", "1")
     s = srv.connect()
     s.sendall(raw_post("/v1/chat/completions", chat("slow:" + " w" * 60)))
     s.sendall(b"x" * 32768)

@@ -369,8 +369,8 @@ def test_extra_hosts(spawn):
     assert request(srv, get(host="evil.com"))[0] == 403
 
 
-def test_extra_hosts_checked_on_unix_socket(spawn, tmp_path):
-    srv = spawn("--unix", str(tmp_path / "s.sock"), "--host", "spore.example.com")
+def test_extra_hosts_checked_on_unix_socket(spawn, sock_path):
+    srv = spawn("--unix", sock_path, "--host", "spore.example.com")
     assert request(srv, get(host="spore.example.com"))[0] == 200
     assert request(srv, get(host="anything.example"))[0] == 403
 
@@ -420,16 +420,16 @@ def test_token_file(spawn, tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["token"]  # no temp file left
 
 
-def test_unix_socket_in_use_is_not_taken_over(spawn, tmp_path):
-    path = str(tmp_path / "spore.sock")
+def test_unix_socket_in_use_is_not_taken_over(spawn, sock_path):
+    path = sock_path
     first = spawn("--unix", path)
     with pytest.raises(RuntimeError):
         spawn("--unix", path)
     assert request(first, get(host="x"))[0] == 200
 
 
-def test_stale_unix_socket_replaced(spawn, tmp_path):
-    path = str(tmp_path / "spore.sock")
+def test_stale_unix_socket_replaced(spawn, sock_path):
+    path = sock_path
     old = spawn("--unix", path)
     old.proc.kill()  # no cleanup: the socket file stays
     old.proc.wait()
@@ -437,8 +437,8 @@ def test_stale_unix_socket_replaced(spawn, tmp_path):
     assert request(spawn("--unix", path), get(host="x"))[0] == 200
 
 
-def test_unix_socket(spawn, tmp_path):
-    path = str(tmp_path / "spore.sock")
+def test_unix_socket(spawn, sock_path):
+    path = sock_path
     srv = spawn("--unix", path)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     # Browsers cannot reach a Unix socket, so Host is not restricted.

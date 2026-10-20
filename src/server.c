@@ -1066,11 +1066,12 @@ int spore_poll(spore_server *s, int timeout_ms) {
     for (size_t i = s->n_conns; i-- > 0;) {
         conn *c = s->conns[i];
         short re = s->pfds[2 + i].revents;
-        /* POLLHUP: the peer cannot receive (POSIX), so stop even with input
-         * unread, as when the buffer is full. A draining connection still
-         * reads to EOF: closing with unread input sends RST, which can
-         * destroy the reply the peer has not yet read. */
-        if ((re & POLLERR) || ((re & POLLHUP) && !c->draining) ||
+        /* POLLHUP is a half-close on macOS, a full close on Linux. Read to
+         * EOF first: closing with unread input sends RST, which can destroy
+         * the reply. Once input is not polled (EOF seen, or buffer full), a
+         * POLLHUP closes. Linux reports it then; macOS does not. */
+        if ((re & POLLERR) ||
+            ((re & POLLHUP) && !(s->pfds[2 + i].events & POLLIN)) ||
             ((re & (POLLIN | POLLHUP)) && conn_read(s, c, now) < 0)) {
             conn_close(s, i);
             continue;
