@@ -295,7 +295,10 @@ def test_hangup_with_full_input_buffer_cancels(spawn, sock_path):
     srv = spawn("--unix", sock_path, "--workers", "1")
     s = srv.connect()
     s.sendall(raw_post("/v1/chat/completions", chat("slow:" + " w" * 60)))
-    s.sendall(b"x" * 32768)
+    s.setblocking(False)  # fill server and kernel buffers, whatever their size
+    with pytest.raises(BlockingIOError):
+        while True:
+            s.send(b"x" * 65536)
     time.sleep(0.2)
     s.close()
     t = time.time()
@@ -328,6 +331,9 @@ def test_queue_full_gives_503(spawn):
 def test_workers_run_in_parallel(spawn):
     srv = spawn("--workers", "3")
     slow = chat("slow:" + " w" * 10)  # ~0.55 s each
+    t = time.time()
+    assert post(srv, "/v1/chat/completions", slow)[0] == 200
+    one = time.time() - t  # baseline: sleeps overshoot on loaded runners
     results = []
     threads = [
         threading.Thread(target=lambda: results.append(post(srv, "/v1/chat/completions", slow)[0]))
@@ -339,7 +345,7 @@ def test_workers_run_in_parallel(spawn):
     for th in threads:
         th.join()
     assert results == [200] * 3
-    assert time.time() - t < 1.2
+    assert time.time() - t < 2 * one  # serial: 3x; two at a time: 2x
 
 
 def test_shutdown_during_generation_exits_cleanly(spawn):
