@@ -6,6 +6,7 @@ import json
 import signal
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -289,6 +290,8 @@ def test_half_closed_client_gets_whole_reply(srv):
     assert json.loads(body)["choices"][0]["message"]["content"] == "slow: a b c"
 
 
+# macOS raises POLLHUP only while input is polled; see docs/dev/gaps.md.
+@pytest.mark.xfail(sys.platform == "darwin", strict=True, reason="hangup seen only on write")
 def test_hangup_with_full_input_buffer_cancels(spawn, sock_path):
     # Input past the 8 KiB head limit stays unread while the reply is
     # pending. Closing a Unix socket raises POLLHUP, which must still cancel.
