@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define SPORE_VERSION "0.1.0"
+#define SPORE_VERSION "0.2.0"
 #define SPORE_MAX_HEADERS 32
 
 typedef struct spore_server spore_server;

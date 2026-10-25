@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int b64val(unsigned char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -61,6 +62,25 @@ static int gcd(int a, int b) {
         b = t;
     }
     return a;
+}
+
+static void put_le(unsigned char *p, uint32_t v, int bytes) {
+    for (int i = 0; i < bytes; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+void spore__wav_header(unsigned char h[44], uint32_t data, int rate) {
+    memcpy(h, "RIFF", 4);
+    put_le(h + 4, 36 + data, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    put_le(h + 16, 16, 4);                  /* fmt chunk size */
+    put_le(h + 20, 1, 2);                   /* PCM */
+    put_le(h + 22, 1, 2);                   /* mono */
+    put_le(h + 24, (uint32_t)rate, 4);
+    put_le(h + 28, (uint32_t)rate * 2, 4);  /* byte rate */
+    put_le(h + 32, 2, 2);                   /* block align */
+    put_le(h + 34, 16, 2);                  /* bits per sample */
+    memcpy(h + 36, "data", 4);
+    put_le(h + 40, data, 4);
 }
 
 /* Windowed-sinc resampling of a whole buffer (Hann window, 16 zero

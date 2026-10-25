@@ -1,6 +1,6 @@
-"""Run the Autobahn fuzzing client (Docker) against spored's /ws/echo.
+"""Run the Autobahn fuzzing client (Docker) against spore's /ws/echo.
 
-Usage: run.py SPORED REPORT_DIR. Exits nonzero if any case FAILED.
+Usage: run.py SPORE_BIN REPORT_DIR. Exits nonzero if any case FAILED.
 
 Excluded in fuzzingclient.json: messages over spore_ws_config.max_message
 (1 MiB; 9.1.4-6, 9.2.4-6, 9.3, 9.4) and permessage-deflate (12, 13),
@@ -12,15 +12,15 @@ import os
 import subprocess
 import sys
 
-spored, reports = sys.argv[1], os.path.abspath(sys.argv[2])
+spore, reports = sys.argv[1], os.path.abspath(sys.argv[2])
 config = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(reports, exist_ok=True)
 
-srv = subprocess.Popen([spored, "--port", "9001"], stdout=subprocess.PIPE, text=True)
+srv = subprocess.Popen([spore, "serve", "--port", "9001"], stdout=subprocess.PIPE, text=True)
 try:
     line = srv.stdout.readline()
     if "listening" not in line:
-        sys.exit(f"spored did not start: {line!r}")
+        sys.exit(f"spore did not start: {line!r}")
     subprocess.run(
         ["docker", "run", "--rm", "--network", "host",
          "-v", f"{config}:/config:ro", "-v", f"{reports}:/reports",

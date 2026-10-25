@@ -1,6 +1,6 @@
 """llama.cpp backend, end to end. Opt-in: `make test-engines`.
 
-Needs SPORED_ENGINES (the binary), SPORE_CHAT_MODEL and SPORE_EMBED_MODEL
+Needs SPORE_ENGINES_BIN (the binary), SPORE_CHAT_MODEL and SPORE_EMBED_MODEL
 (GGUF paths); skipped otherwise.
 """
 
@@ -10,15 +10,15 @@ import subprocess
 
 import pytest
 
-BIN = os.environ.get("SPORED_ENGINES")
+BIN = os.environ.get("SPORE_ENGINES_BIN")
 CHAT = os.environ.get("SPORE_CHAT_MODEL")
 EMBED = os.environ.get("SPORE_EMBED_MODEL")
 
-pytestmark = pytest.mark.skipif(not BIN, reason="SPORED_ENGINES not set")
+pytestmark = pytest.mark.skipif(not BIN, reason="SPORE_ENGINES_BIN not set")
 
 
 def start(*args):
-    p = subprocess.Popen([BIN, "--port", "0", *args], stdout=subprocess.PIPE, text=True)
+    p = subprocess.Popen([BIN, "serve", "--port", "0", *args], stdout=subprocess.PIPE, text=True)
     line = p.stdout.readline()
     assert "listening" in line, line
     return p, int(line.rsplit(":", 1)[1])
@@ -28,7 +28,7 @@ def start(*args):
 def chat_port():
     if not CHAT:
         pytest.skip("SPORE_CHAT_MODEL not set")
-    p, port = start("--model", CHAT, "--ctx", "2048")
+    p, port = start("--model", CHAT, "--ctx-size", "2048")
     yield port
     p.terminate()
     assert p.wait(timeout=10) == 0

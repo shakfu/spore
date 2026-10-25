@@ -49,6 +49,10 @@ Number parsing and printing swap the locale radix, because `strtod` and `printf`
 
 Token boundaries match neither stop strings nor UTF-8 sequences. Handling both in `llm.c` means each backend only emits raw bytes. The emitter holds back the longest tail that could begin a stop string, plus any incomplete UTF-8 sequence. The JSON writer replaces invalid UTF-8 with U+FFFD, so the output is always valid JSON.
 
+## Error bodies follow llama-server
+
+Error bodies carry `message`, `type` and the HTTP status as an integer `code`, with no `param`. llama-server sends the same shape (`format_error_response` in `tools/server/server-common.cpp`). OpenAI sends a string or null `code` and a `param`. spore stands in for llama-server, so its shape wins. The `openai` Python SDK turns an integer `code` into a string (`"400"`) and a missing `param` into `None`.
+
 ## WebSockets on a generic upgrade hook
 
 The core knows nothing about WebSocket framing. `spore__upgrade()` sends the 101 response and hands the connection's raw input to a callback. The existing response object carries all output. That object is already thread-safe and wakes the loop, so frames can come from any thread with no second queue. The module is optional in practice, not just in name. The core gains 93 lines, and `ws.c` plus `sha1.c` link only when used.

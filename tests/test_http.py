@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from conftest import SPORED, read_response, request, wait_for
+from conftest import SPORE, read_response, request, wait_for
 
 
 def get(path="/health", host="localhost", extra=""):
@@ -218,7 +218,7 @@ def test_chunked_body_over_limit_gets_413(srv):
 
 
 def test_chunked_body_not_read_as_request_after_401(spawn):
-    srv = spawn("--token", "t")
+    srv = spawn("--api-key", "t")
     inner = get()
     with srv.connect() as s:
         s.sendall(CHUNKED_POST + b"\r\n" + f"{len(inner):x}\r\n".encode() + inner + b"\r\n0\r\n\r\n")
@@ -248,7 +248,7 @@ def test_idle_connection_closed(spawn):
 
 def test_stalled_reader_closed(tmp_path, spawn):
     (tmp_path / "big.bin").write_bytes(bytes(32 << 20))
-    srv = spawn("--static", str(tmp_path), "--idle-ms", "300")
+    srv = spawn("--path", str(tmp_path), "--idle-ms", "300")
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     s.connect(("127.0.0.1", srv.port))
@@ -268,7 +268,7 @@ def test_stalled_reader_closed(tmp_path, spawn):
     (sum((["--origin", f"http://a{i}"] for i in range(16)), []), "--origin"),
 ])
 def test_bad_flags_rejected(args, needle):
-    p = subprocess.run([SPORED, *args], capture_output=True, text=True, timeout=5)
+    p = subprocess.run([SPORE, "serve", *args], capture_output=True, text=True, timeout=5)
     assert p.returncode == 2 and needle in p.stderr
 
 
@@ -362,7 +362,7 @@ def test_origins_only(spawn):
 
 
 def test_extra_hosts(spawn):
-    srv = spawn("--host", "spore.example.com")
+    srv = spawn("--allow-host", "spore.example.com")
     assert request(srv, get(host="Spore.Example.com"))[0] == 200
     assert request(srv, get(host="spore.example.com:443"))[0] == 200
     assert request(srv, get(host="localhost"))[0] == 200
@@ -370,13 +370,13 @@ def test_extra_hosts(spawn):
 
 
 def test_extra_hosts_checked_on_unix_socket(spawn, sock_path):
-    srv = spawn("--unix", sock_path, "--host", "spore.example.com")
+    srv = spawn("--unix", sock_path, "--allow-host", "spore.example.com")
     assert request(srv, get(host="spore.example.com"))[0] == 200
     assert request(srv, get(host="anything.example"))[0] == 403
 
 
 def test_preflight(spawn):
-    srv = spawn("--token", "s3cret")
+    srv = spawn("--api-key", "s3cret")
     raw = (
         b"OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
         b"Origin: http://localhost:3000\r\nAccess-Control-Request-Method: POST\r\n"
@@ -390,7 +390,7 @@ def test_preflight(spawn):
 
 
 def test_bearer_token(spawn):
-    srv = spawn("--token", "s3cret")
+    srv = spawn("--api-key", "s3cret")
     status, h, _ = request(srv, get())
     assert status == 401 and h["www-authenticate"] == "Bearer"
     assert request(srv, get(extra="Authorization: Bearer wrong\r\n"))[0] == 401
@@ -399,7 +399,7 @@ def test_bearer_token(spawn):
 
 
 def test_token_rejection_keeps_pipelined_request(spawn):
-    srv = spawn("--token", "t")
+    srv = spawn("--api-key", "t")
     with srv.connect() as s:
         s.sendall(get() + get(extra="Authorization: Bearer t\r\n"))
         assert read_response(s)[0] == 401
@@ -410,14 +410,15 @@ def test_token_file(spawn, tmp_path):
     path = tmp_path / "token"
     path.write_text("old")
     os.chmod(path, 0o644)
-    srv = spawn("--token-file", str(path))
+    assert subprocess.run([SPORE, "token", str(path)], timeout=5).returncode == 0
     token = path.read_text().strip()
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert len(token) == 64 and int(token, 16) >= 0
+    assert [p.name for p in tmp_path.iterdir()] == ["token"]  # no temp file left
+    srv = spawn("--api-key-file", str(path))
     assert srv.proc.stdout.readline().strip() == f"open http://localhost:{srv.port}/#token={token}"
     assert request(srv, get())[0] == 401
     assert request(srv, get(extra=f"Authorization: Bearer {token}\r\n"))[0] == 200
-    assert [p.name for p in tmp_path.iterdir()] == ["token"]  # no temp file left
 
 
 def test_unix_socket_in_use_is_not_taken_over(spawn, sock_path):
@@ -488,7 +489,7 @@ def site(tmp_path, spawn):
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "config").write_text("[core]")
     (tmp_path / "sub" / ".hidden").write_text("h")
-    return spawn("--static", str(tmp_path))
+    return spawn("--path", str(tmp_path))
 
 
 def test_static_files(site):
@@ -532,7 +533,7 @@ def media(tmp_path, spawn):
     data = bytes(range(256)) * 4
     (tmp_path / "a.bin").write_bytes(data)
     (tmp_path / "empty.bin").write_bytes(b"")
-    return spawn("--static", str(tmp_path)), data
+    return spawn("--path", str(tmp_path)), data
 
 
 @pytest.mark.parametrize(
@@ -598,11 +599,11 @@ def test_access_log(spawn):
     assert srv.stop() == 0
     lines = srv.proc.stderr.read().splitlines()
     pats = [
-        r"spored: GET /health 200 (\d+) \d+ms$",
-        r"spored: GET /missing\?q=1 404 \d+ \d+ms route$",
-        r"spored: GET /health 403 \d+ \d+ms host$",
-        r"spored:   400 \d+ \d+ms parse$",
-        r"spored: POST /echo 200 \d+ \d+ms$",
+        r"spore: GET /health 200 (\d+) \d+ms$",
+        r"spore: GET /missing\?q=1 404 \d+ \d+ms route$",
+        r"spore: GET /health 403 \d+ \d+ms host$",
+        r"spore:   400 \d+ \d+ms parse$",
+        r"spore: POST /echo 200 \d+ \d+ms$",
     ]
     assert len(lines) == len(pats), lines
     for line, pat in zip(lines, pats):

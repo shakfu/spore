@@ -142,6 +142,8 @@ void spore__think_advance(spore__think *t, const char *a, size_t to, int final,
 long spore__base64_decode(char *s, size_t n);
 void spore__pcm16_to_float(const int16_t *in, size_t n, float *out);
 void spore__float_to_pcm16le(const float *in, size_t n, unsigned char *out);
+/* 44-byte header of a 16-bit mono PCM WAV holding `data` bytes. */
+void spore__wav_header(unsigned char h[44], uint32_t data, int rate);
 /* Resample a whole buffer; returns malloc'd samples (count in *out_n). */
 float *spore__resample(const float *in, size_t n, int from, int to,
                        size_t *out_n);

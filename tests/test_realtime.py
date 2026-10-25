@@ -410,7 +410,7 @@ def test_items_insert_delete_retrieve(rt):
 
 
 def test_browser_subprotocol_auth(spawn):
-    srv = spawn("--token", "s3cret")
+    srv = spawn("--api-key", "s3cret")
     url = f"ws://127.0.0.1:{srv.port}/v1/realtime"
     with wsclient.connect(url, subprotocols=["realtime", "openai-insecure-api-key.s3cret"]) as ws:
         assert ws.subprotocol == "realtime"  # the key is never echoed

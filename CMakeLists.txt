@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(spore VERSION 0.1.0 LANGUAGES C)
+project(spore VERSION 0.2.0 LANGUAGES C)
 
 # ---- options ---------------------------------------------------------------
 # The core (HTTP/1.1, access policy, static files, JSON) is always built.
@@ -8,7 +8,7 @@ option(SPORE_LLM "OpenAI-compatible LLM endpoints (spore_llm.h)" ON)
 include(CMakeDependentOption)
 cmake_dependent_option(SPORE_REALTIME
   "OpenAI Realtime API over WebSocket (spore_realtime.h); needs SPORE_WS" ON SPORE_WS OFF)
-option(SPORE_BUILD_EXAMPLES "Build spored" ${PROJECT_IS_TOP_LEVEL})
+option(SPORE_BUILD_EXAMPLES "Build the spore executable" ${PROJECT_IS_TOP_LEVEL})
 option(SPORE_BUILD_TESTS "Build tests (needs examples for integration)" ${PROJECT_IS_TOP_LEVEL})
 option(SPORE_FUZZ "Build libFuzzer targets (clang only)" OFF)
 set(SPORE_SANITIZE "" CACHE STRING
@@ -101,23 +101,25 @@ install(FILES ${PROJECT_BINARY_DIR}/spore-config.cmake
               ${PROJECT_BINARY_DIR}/spore-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spore)
 
-# ---- spored ------------------------------------------------------------------
+# ---- spore executable ---------------------------------------------------------
 
 if(SPORE_BUILD_EXAMPLES)
-  set(SPORED_SRC examples/spored.c)
+  set(CLI_SRC examples/spore.c examples/serve.c)
   if(SPORE_LLM OR SPORE_REALTIME)
-    list(APPEND SPORED_SRC examples/echo_backend.c)
+    list(APPEND CLI_SRC examples/echo_backend.c)
   endif()
   if(SPORE_REALTIME)
-    list(APPEND SPORED_SRC examples/rt_mock_backend.c)
+    list(APPEND CLI_SRC examples/rt_mock_backend.c)
   endif()
-  add_executable(spored ${SPORED_SRC})
-  spore_c_target(spored)
-  target_include_directories(spored PRIVATE examples)
-  target_link_libraries(spored PRIVATE spore)
+  # The target `spore` is the library; the executable is also named spore.
+  add_executable(spore_cli ${CLI_SRC})
+  set_target_properties(spore_cli PROPERTIES OUTPUT_NAME spore)
+  spore_c_target(spore_cli)
+  target_include_directories(spore_cli PRIVATE examples)
+  target_link_libraries(spore_cli PRIVATE spore)
 
   # ---- engine adapters (backends/) -------------------------------------
-  # Each adapter links one engine; spored-engines combines those configured.
+  # Each adapter links one engine; spore-engines combines those configured.
   # ggml is linked once: llama.cpp's copy when present, else whisper.cpp's.
   # whisper.cpp built against ggml 0.23 links against llama.cpp's 0.25:
   # the ggml_tensor layout and the precision API it uses are unchanged.
@@ -204,12 +206,13 @@ if(SPORE_BUILD_EXAMPLES)
   endif()
 
   if(engine_libs)
-    add_executable(spored-engines ${SPORED_SRC})
-    spore_c_target(spored-engines)
-    target_compile_definitions(spored-engines PRIVATE ${engine_defs})
-    target_include_directories(spored-engines PRIVATE examples)
-    target_link_libraries(spored-engines PRIVATE ${engine_libs})
-    set_target_properties(spored-engines PROPERTIES LINKER_LANGUAGE CXX)
+    add_executable(spore-engines ${CLI_SRC})
+    spore_c_target(spore-engines)
+    target_compile_definitions(spore-engines PRIVATE ${engine_defs})
+    # transcribe and speak reuse the WAV and resampling helpers
+    target_include_directories(spore-engines PRIVATE examples src)
+    target_link_libraries(spore-engines PRIVATE ${engine_libs})
+    set_target_properties(spore-engines PROPERTIES LINKER_LANGUAGE CXX)
   endif()
 endif()
 
@@ -249,10 +252,10 @@ if(SPORE_BUILD_TESTS)
               pytest -q -p no:cacheprovider ${PROJECT_SOURCE_DIR}/tests
       WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/tests)
     set_tests_properties(integration PROPERTIES
-      ENVIRONMENT "SPORED=$<TARGET_FILE:spored>")
+      ENVIRONMENT "SPORE_BIN=$<TARGET_FILE:spore_cli>")
 
     # Real engines and models: excluded from `make test`, run by `make test-engines`.
-    if(TARGET spored-engines AND SPORE_TEST_MODELS)
+    if(TARGET spore-engines AND SPORE_TEST_MODELS)
       set(m ${SPORE_TEST_MODELS})
       add_test(NAME engines
         COMMAND ${UV} run --no-project --with pytest --with "openai[realtime]" --with websockets
@@ -260,7 +263,7 @@ if(SPORE_BUILD_TESTS)
                 ${PROJECT_SOURCE_DIR}/tests/test_llama.py ${PROJECT_SOURCE_DIR}/tests/test_engines.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/tests)
       set_tests_properties(engines PROPERTIES LABELS engines ENVIRONMENT
-        "SPORED=$<TARGET_FILE:spored>;SPORED_ENGINES=$<TARGET_FILE:spored-engines>;SPORE_CHAT_MODEL=${m}/Qwen3-0.6B-Q8_0.gguf;SPORE_EMBED_MODEL=${m}/bge-small-en-v1.5-q8_0.gguf;SPORE_VOICE_LLM=${m}/Llama-3.2-1B-Instruct-Q8_0.gguf;SPORE_ASR_MODEL=${m}/ggml-base.en.bin;SPORE_ASR_SAMPLE=${SPORE_ASR_SAMPLE};SPORE_TTS_MODEL=${m}/OuteTTS-0.3-1B-Q6_K.gguf;SPORE_VOCODER=${m}/WavTokenizer-Large-75-F16.gguf;SPORE_ENGINE_GPU=${SPORE_ENGINE_GPU}")
+        "SPORE_BIN=$<TARGET_FILE:spore_cli>;SPORE_ENGINES_BIN=$<TARGET_FILE:spore-engines>;SPORE_CHAT_MODEL=${m}/Qwen3-0.6B-Q8_0.gguf;SPORE_EMBED_MODEL=${m}/bge-small-en-v1.5-q8_0.gguf;SPORE_VOICE_LLM=${m}/Llama-3.2-1B-Instruct-Q8_0.gguf;SPORE_ASR_MODEL=${m}/ggml-base.en.bin;SPORE_ASR_SAMPLE=${SPORE_ASR_SAMPLE};SPORE_TTS_MODEL=${m}/OuteTTS-0.3-1B-Q6_K.gguf;SPORE_VOCODER=${m}/WavTokenizer-Large-75-F16.gguf;SPORE_ENGINE_GPU=${SPORE_ENGINE_GPU}")
     endif()
   elseif(SPORE_BUILD_EXAMPLES)
     message(STATUS "uv not found: integration tests disabled")

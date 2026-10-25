@@ -82,14 +82,14 @@ fuzz-run: fuzz
 	done
 
 # ---- Autobahn WebSocket testsuite (needs Docker) -----------------------------
-# The fuzzing client connects to spored's /ws/echo over the host network.
+# The fuzzing client connects to spore's /ws/echo over the host network.
 # Reports go to $(BUILD)/autobahn/index.html.
 
 autobahn: all
-	python3 tests/autobahn/run.py $(BUILD)/spored $(BUILD)/autobahn
+	python3 tests/autobahn/run.py $(BUILD)/spore $(BUILD)/autobahn
 
 # ---- engine adapters -------------------------------------------------------
-# spored-engines: llama.cpp (LLM) and whisper.cpp (ASR) behind the mock TTS.
+# spore-engines: spore with the llama.cpp, whisper.cpp and OuteTTS engines.
 
 engines:
 	@$(CMAKE) -S . -B $(BUILD) $(CONFIG) -DSPORE_LLAMA_DIR=$(abspath $(LLAMA_DIR)) \

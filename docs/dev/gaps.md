@@ -8,7 +8,6 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 |---|---|---|
 | A closed TCP client is seen only on write | EOF is a half-close, so a TCP client that closes is noticed when a write fails. A non-streaming LLM reply keeps generating until it ends. On Linux, Unix-socket peers raise `POLLHUP` and are noticed at once; on macOS they are noticed like TCP | None that keeps half-close: TCP cannot tell `close()` from `shutdown(SHUT_WR)` without writing |
 | Unix socket mode set after `bind` | Between `bind` and `chmod` the mode follows the umask; `chmod` follows a swapped-in symlink. The peer-uid check still applies | A `0177` umask around `bind`, but umask is process-wide and races other threads; `fchmod` before `bind` works on Linux only |
-| WebSocket token subprotocol without a selected protocol | A browser that offers only `openai-insecure-api-key.<tok>` passes auth, then fails the handshake, because no protocol is echoed | Offer the route's protocol too, as OpenAI's SDK does with `realtime` |
 
 ## HTTP server
 
@@ -77,8 +76,6 @@ Open issues found during the 0.1.0 work. Deliberate deviations from the RFCs are
 - **Unsupported request features:** tool calls, image and audio content, `n > 1`, logprobs, token-array inputs to embeddings.
 
 - **Ignored sampling fields.** `presence_penalty`, `frequency_penalty`, `logit_bias` and embeddings `dimensions` are accepted and ignored. Clients send the penalties by default, so refusing them would break those clients.
-
-- **Error shape.** Error bodies carry an integer `code` and no `param`; OpenAI uses a string or null.
 
 - **Duplicate JSON keys: the first wins.** A proxy that parses with Python or JavaScript reads the last. Rejecting duplicates costs O(n^2) per object without a hash.
 

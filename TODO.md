@@ -76,4 +76,4 @@ Needed before serving through a forwarder or proxy, or to several users. spore's
 
 - [ ] Add the soak test to the nightly CI: realtime and HTTP traffic against an ASan build, with RSS sampled over time.
 
-- [ ] Release process: tag 0.1.0, and keep the CHANGELOG's released sections fixed from then on.
+- [x] Release process: tag 0.1.0, and keep the CHANGELOG's released sections fixed from then on.

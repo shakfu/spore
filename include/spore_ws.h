@@ -36,7 +36,9 @@ typedef struct {
     void (*on_drain)(spore_ws *ws, void *ud);
     size_t drain_at;    /* 64 KiB */
     size_t max_message; /* 1 MiB; larger messages close with 1009 */
-    const char *protocol; /* subprotocol to select when the client offers it */
+    /* Subprotocol to select when the client offers it. Browsers sending the
+     * token as a subprotocol need one selected, or they fail the handshake. */
+    const char *protocol;
 } spore_ws_config;
 
 /* In a handler, on the loop thread: complete the handshake. Returns the

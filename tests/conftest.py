@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-SPORED = os.environ.get("SPORED", str(Path(__file__).parents[1] / "build" / "spored"))
-# Modules compiled into this spored; tests for absent ones are skipped.
-MODULES = set(subprocess.run([SPORED, "--modules"], capture_output=True, text=True).stdout.split())
+SPORE = os.environ.get("SPORE_BIN", str(Path(__file__).parents[1] / "build" / "spore"))
+# Modules compiled into this spore; tests for absent ones are skipped.
+MODULES = set(subprocess.run([SPORE, "modules"], capture_output=True, text=True).stdout.split())
 
 
 def requires(module):
@@ -24,16 +24,16 @@ class Server:
             resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
 
         self.proc = subprocess.Popen(
-            [SPORED, "--port", "0", *args],
+            [SPORE, "serve", "--port", "0", *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             preexec_fn=limit if nofile else None,
         )
         line = self.proc.stdout.readline().strip()
-        if not line.startswith("spored listening on "):
+        if not line.startswith("spore listening on "):
             self.proc.kill()
-            raise RuntimeError(f"spored failed: {line} {self.proc.stderr.read()}")
+            raise RuntimeError(f"spore failed: {line} {self.proc.stderr.read()}")
         self.addr = line.rsplit(" ", 1)[1]
         if self.addr.startswith("unix:"):
             self.unix = self.addr[5:]

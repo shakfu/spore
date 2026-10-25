@@ -6,7 +6,7 @@ A minimal HTTP/1.1 server in C11 that only serves the local machine. It includes
 
 - POSIX only (Linux, macOS, BSD). No dependencies beyond libc and pthreads.
 
-- 5,400 lines of C in `src/` (2,200 in the core) plus 490 lines of headers. The demo server has 112 KB of code with every module (37 KB core only) and runs in 2 MB RSS.
+- 5,400 lines of C in `src/` (2,200 in the core) plus 490 lines of headers. The `spore` executable has 105 KB of code with every module (41 KB core only, `MinSizeRel`) and runs in 2 MB RSS.
 
 ## Scope
 
@@ -25,7 +25,7 @@ A local server's main attacker is a web page in the user's browser. So every req
 
 CORS preflights from allowed origins are answered automatically. TLS is not supported: loopback traffic never leaves the host.
 
-Loopback origins are allowed by default so a UI dev server on another port works without configuration. That also admits pages from every other local server. A deployment that knows its UI origin sets `origins_only` (`spored --origins-only --origin ...`).
+Loopback origins are allowed by default so a UI dev server on another port works without configuration. That also admits pages from every other local server. A deployment that knows its UI origin sets `origins_only` (`spore serve --origins-only --origin ...`).
 
 Which transport to use:
 
@@ -36,11 +36,11 @@ Which transport to use:
 | Anything behind a forwarder or proxy | TCP with a token |
 | Any client, single-user host, no forwarder | TCP without a token is acceptable. Any local process can connect |
 
-`spored --token-file PATH` generates a 32-byte token, writes it to `PATH` with mode `0600`, and prints `http://localhost:<port>/#token=<token>`. Browsers never send the fragment to a server, so it appears in no log or `Referer`. A page reads it and sends `Authorization: Bearer`. `spored --token T` still works, but other users can read `T` with `ps`.
+`spore token PATH` writes a random 32-byte key to `PATH` with mode `0600`. `spore serve --api-key-file PATH` reads it and prints `http://localhost:<port>/#token=<key>`. Browsers never send the fragment to a server, so it appears in no log or `Referer`. A page reads it and sends `Authorization: Bearer`. `--api-key KEY` also works, but other users can read `KEY` with `ps`.
 
 ### Behind a reverse proxy
 
-The proxy passes the client's `Host` unchanged, and spore accepts the public name through `--host`. spore's Host check then still rejects DNS rebinding through the proxy. An nginx example:
+The proxy passes the client's `Host` unchanged, and spore accepts the public name through `--allow-host`. spore's Host check then still rejects DNS rebinding through the proxy. An nginx example:
 
 ```nginx
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
@@ -64,8 +64,9 @@ server {
 ```
 
 ```sh
-spored --port 8080 --token-file ~/.spore-token \
-    --host spore.example.com --origins-only --origin https://spore.example.com
+spore token ~/.spore-token
+spore serve --port 8080 --api-key-file ~/.spore-token \
+    --allow-host spore.example.com --origins-only --origin https://spore.example.com
 ```
 
 - **Require the token.** Every remote client arrives from the proxy's loopback address.
@@ -82,24 +83,24 @@ spore builds with CMake 3.21 or later. The `Makefile` is a thin frontend to `cma
 
 Modules are chosen at compile time. The core is always built. Each module adds only its own objects to `libspore.a`:
 
-| Module | CMake option | Adds | Needs | `spored` code size |
+| Module | CMake option | Adds | Needs | `spore` code size |
 |---|---|---|---|---|
-| core | - | HTTP/1.1, access policy, static files, JSON | - | 37 KB |
-| `ws` | `SPORE_WS` | WebSocket (`spore_ws.h`) | core | +17 KB |
-| `llm` | `SPORE_LLM` | OpenAI-compatible chat, completions, embeddings (`spore_llm.h`) | core | +23 KB |
-| `realtime` | `SPORE_REALTIME` | OpenAI Realtime API, speech to speech, `/v1/audio/speech` (`spore_realtime.h`) | `ws` | +43 KB |
+| core | - | HTTP/1.1, access policy, static files, JSON | - | 41 KB |
+| `ws` | `SPORE_WS` | WebSocket (`spore_ws.h`) | core | +15 KB |
+| `llm` | `SPORE_LLM` | OpenAI-compatible chat, completions, embeddings (`spore_llm.h`) | core | +20 KB |
+| `realtime` | `SPORE_REALTIME` | OpenAI Realtime API, speech to speech, `/v1/audio/speech` (`spore_realtime.h`) | `ws` | +37 KB |
 
-Tests for modules left out are skipped. `spored --modules` lists what was built.
+Tests for modules left out are skipped. `spore modules` lists what was built.
 
 ```sh
-make                      # build/libspore.a, build/spored; MODULES="ws llm realtime" by default
+make                      # build/libspore.a, build/spore; MODULES="ws llm realtime" by default
 make MODULES="ws"         # choose modules
 make test                 # ctest: unit tests, fuzz seed replay, pytest integration (needs uv)
 make asan tsan            # the same suites under sanitizers
 make check-modules        # build and test every module set
 make fuzz-run             # libFuzzer: HTTP, JSON, WebSocket, realtime events, connections (clang), FUZZ_TIME=60 each
 make autobahn             # Autobahn WebSocket testsuite against /ws/echo (Docker)
-make engines              # build/spored-engines with llama.cpp and whisper.cpp (LLAMA_DIR, WHISPER_DIR)
+make engines              # build/spore-engines with llama.cpp, whisper.cpp, OuteTTS (LLAMA_DIR, WHISPER_DIR)
 make test-engines         # end-to-end with real models (MODELS=dir, ASR_SAMPLE=wav)
 make install PREFIX=...   # headers, libspore.a, CMake package
 ```
@@ -116,13 +117,38 @@ Other options: `SPORE_SANITIZE` (for example `address,undefined`), `SPORE_FUZZ`,
 To use spore from another CMake project, vendor it or install it:
 
 ```cmake
-add_subdirectory(spore)          # or: find_package(spore 0.1 REQUIRED)
+add_subdirectory(spore)          # or: find_package(spore 0.2 REQUIRED)
 target_link_libraries(app PRIVATE spore::spore)
 ```
 
 `spore::spore` carries `SPORE_WITH_WS`, `SPORE_WITH_LLM` and `SPORE_WITH_REALTIME` as compile definitions, so the application can `#ifdef` on the modules it was built with.
 
+## Command line
+
+`spore` is one binary with subcommands. `spore-engines` is the same binary linked with the engines (`make engines`).
+
+| Command | Does |
+|---|---|
+| `spore serve` | The HTTP server: static files, the OpenAI-compatible API, realtime |
+| `spore transcribe -m MODEL FILE.wav` | Print the speech in a 16-bit PCM WAV, any rate (whisper.cpp) |
+| `spore speak -m MODEL --vocoder PATH -o OUT.wav TEXT` | Synthesize 24 kHz mono speech (OuteTTS) |
+| `spore token FILE` | Write a random key with mode `0600`, for `serve --api-key-file` |
+| `spore modules`, `spore version` | Print the compiled-in modules and engines, or the version |
+
+`spore <command> --help` lists the options. `transcribe` and `speak` need `spore-engines`.
+
+`serve` takes llama-server's names for the options both have: `-m`, `-a`/`--alias`, `-c`/`--ctx-size`, `-ngl`, `-t`, `-np`/`--parallel`, `--embedding`, `--api-key`, `--api-key-file`, `--path` and `--port`. A link named `llama-server` runs `serve`:
+
+```sh
+ln -s "$(command -v spore-engines)" ~/bin/llama-server
+llama-server -m Qwen3-0.6B-Q8_0.gguf -c 8192 --port 8080
+```
+
+Any other llama-server option, such as `--jinja` or `--temp`, exits with status 2. `--host` accepts only `127.0.0.1`, `localhost`, `::1`, or a socket path ending in `.sock`. Other addresses exit with status 2. spore's own Host allowlist is `--allow-host`.
+
 ## Library use
+
+The C API and ABI may change in any 0.x release. Pin a tag.
 
 ```c
 #include "spore.h"
@@ -172,7 +198,7 @@ static void upgrade(spore_req *req, spore_resp *resp, void *ud) {
 }
 ```
 
-Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/spored.c` shows this policy. A producer that must not drop can pause instead, and resume when `on_drain` reports the queue empty (`/ws/stream?wait=1`). A send that would queue more than `spore_config.max_pending` bytes closes the connection.
+Callbacks run on the loop thread. `spore_ws_send()` and `spore_ws_close()` are safe from any thread, so an audio thread can send frames directly. `spore_ws_pending()` reports queued bytes. A real-time producer can drop or coarsen frames when a client falls behind, instead of letting latency grow. `/ws/stream` in `examples/serve.c` shows this policy. A producer that must not drop can pause instead, and resume when `on_drain` reports the queue empty (`/ws/stream?wait=1`). A send that would queue more than `spore_config.max_pending` bytes closes the connection.
 
 `/ws/duplex` shows the full-duplex pattern for speech in and audio out:
 
@@ -196,7 +222,7 @@ Measured on one core over loopback, with a Python client:
 
 Not supported: extensions (including `permessage-deflate`) and server-initiated pings.
 
-Browsers cannot set `Authorization` on a WebSocket. When `spore_config.token` is set, the core also accepts the token as the subprotocol `openai-insecure-api-key.<token>`, which is OpenAI's browser convention. This applies to any route. The key entry is never echoed back.
+Browsers cannot set `Authorization` on a WebSocket. When `spore_config.token` is set, the core also accepts the token as the subprotocol `openai-insecure-api-key.<token>`, which is OpenAI's browser convention. This applies to any route. The key entry is never echoed back. A browser fails a handshake that offers subprotocols and gets none selected ([WHATWG Fetch](https://fetch.spec.whatwg.org/#websocket-opening-handshake)). So the route must set `spore_ws_config.protocol`, and the browser must offer it beside the key, as with `realtime`.
 
 ## Realtime API
 
@@ -234,13 +260,13 @@ With a TTS stage, `spore_rt_new()` also serves `POST /v1/audio/speech`, OpenAI's
 
 Not supported yet: tools, G.711 formats, transcription-only sessions, out-of-band responses (`conversation: "none"`), and audio in `conversation.item.retrieved`. See [docs/dev/gaps.md](docs/dev/gaps.md).
 
-`spored` serves the mock backend in `examples/rt_mock_backend.c`: its transcripts report the audio length, it echoes the text, and it speaks a tone.
+`spore serve` uses the mock backend in `examples/rt_mock_backend.c`: its transcripts report the audio length, it echoes the text, and it speaks a tone.
 
-`spored-engines` replaces the mock stages with the engines it was given:
+`spore-engines serve` replaces the mock stages with the engines it was given:
 
 ```sh
 make engines
-build/spored-engines --model Llama-3.2-1B-Instruct-Q8_0.gguf --asr ggml-base.en.bin \
+build/spore-engines serve --model Llama-3.2-1B-Instruct-Q8_0.gguf --asr ggml-base.en.bin \
     --tts OuteTTS-0.3-1B-Q6_K.gguf --vocoder WavTokenizer-Large-75-F16.gguf
 ```
 
@@ -275,7 +301,7 @@ For a GPU build, point `LLAMA_DIR` and `WHISPER_DIR` at llama.cpp and whisper.cp
 mkdir -p deps && cd deps
 GGML_CUDA=1 CMAKE_CUDA_ARCHITECTURES=89 python3 ~/projects/cyllama/scripts/manage.py build -l -w -D --cuda
 cd .. && make engines BUILD=build-gpu LLAMA_DIR=deps/thirdparty/llama.cpp WHISPER_DIR=deps/thirdparty/whisper.cpp
-build-gpu/spored-engines --gpu --model ... --asr ... --tts ... --vocoder ...
+build-gpu/spore-engines serve --gpu --model ... --asr ... --tts ... --vocoder ...
 ```
 
 CMake links `libggml-cuda.a` (or `libggml-vulkan.a`) when it is present in `LLAMA_DIR`.
@@ -316,13 +342,13 @@ Sampling defaults follow llama-server: temperature 0.8, top_k 40, top_p 0.95, mi
 
 ```sh
 make engines
-build/spored-engines --model Qwen3-0.6B-Q8_0.gguf --port 8080
-build/spored-engines --model bge-small-en-v1.5-q8_0.gguf --embedding --port 8081
+build/spore-engines serve --model Qwen3-0.6B-Q8_0.gguf --port 8080
+build/spore-engines serve --model bge-small-en-v1.5-q8_0.gguf --embedding --port 8081
 ```
 
 The official `openai` Python SDK passes against both (`tests/test_llm.py`, `tests/test_llama.py`).
 
-The backend keeps its KV cache between requests. It re-evaluates only the prompt suffix that is not already cached, and reports reused tokens in `usage.prompt_tokens_details.cached_tokens`. `spore_llama_config.n_slots` sets the number of cache slots. The library default is 1; `spored-engines` uses 4 (`--slots`). With several slots, interleaved conversations do not evict each other:
+The backend keeps its KV cache between requests. It re-evaluates only the prompt suffix that is not already cached, and reports reused tokens in `usage.prompt_tokens_details.cached_tokens`. `spore_llama_config.n_slots` sets the number of cache slots. The library default is 1; `spore serve` uses 4 (`-np`/`--parallel`). With several slots, interleaved conversations do not evict each other:
 
 - A request extends the slot with the longest shared prefix, when that discards at most one token.
 
@@ -330,7 +356,7 @@ The backend keeps its KV cache between requests. It re-evaluates only the prompt
 
 - When the context is full, other slots are evicted, least recently used first.
 
-All slots share one `n_ctx`-sized KV buffer, and attention spans every cell in it. With three other slots holding about 2k tokens each, generation with Qwen3-0.6B on CPU drops from 67.6 to 58.0 tokens/s. `--slots 1` restores the single-cache behaviour. As in llama-server, cached and uncached runs can differ in their greedy output, because logits depend on batch shape. Send `"cache_prompt": false` for reproducible output.
+All slots share one `n_ctx`-sized KV buffer, and attention spans every cell in it. With three other slots holding about 2k tokens each, generation with Qwen3-0.6B on CPU drops from 67.6 to 58.0 tokens/s. `--parallel 1` restores the single-cache behaviour. As in llama-server, cached and uncached runs can differ in their greedy output, because logits depend on batch shape. Send `"cache_prompt": false` for reproducible output.
 
 A leading `<think>` block in a chat reply, as Qwen3 emits, goes to `reasoning_content`, streamed or not. Send `"reasoning_format": "none"` for the raw text. When the chat template opens the block in the prompt, `spore_llama` emits the tag first, so the reply is split the same way. The realtime module neither sends nor speaks the block.
 
@@ -351,4 +377,4 @@ Defaults, all set in `spore_config`:
 | Receive deadline per request | 30 s |
 | Unsent streamed output per response | 16 MiB; past it the connection closes |
 
-Absolute-form request targets get 400. A client that half-closes its connection (`shutdown(SHUT_WR)`) after sending requests still receives the responses. `spore_serve_dir()` reads each file, or the requested `Range`, whole, so it suits UI assets and media clips, not large media. `spore_config.log` receives one record per request; `spored --log` prints them. Design decisions are in [docs/dev/design.md](docs/dev/design.md). Known gaps are in [docs/dev/gaps.md](docs/dev/gaps.md).
+Absolute-form request targets get 400. A client that half-closes its connection (`shutdown(SHUT_WR)`) after sending requests still receives the responses. `spore_serve_dir()` reads each file, or the requested `Range`, whole, so it suits UI assets and media clips, not large media. `spore_config.log` receives one record per request; `spore serve --log` prints them. Design decisions are in [docs/dev/design.md](docs/dev/design.md). Known gaps are in [docs/dev/gaps.md](docs/dev/gaps.md).

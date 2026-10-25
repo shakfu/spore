@@ -1,7 +1,7 @@
 """Realtime with real engines: whisper.cpp ASR, llama.cpp LLM, OuteTTS.
 Opt-in: `make test-engines`.
 
-Needs SPORED_ENGINES, SPORE_ASR_MODEL, SPORE_VOICE_LLM and SPORE_ASR_SAMPLE
+Needs SPORE_ENGINES_BIN, SPORE_ASR_MODEL, SPORE_VOICE_LLM and SPORE_ASR_SAMPLE
 (a 16 kHz mono WAV of JFK's "ask not" line, whisper.cpp's samples/jfk.wav);
 the speech-output tests also need SPORE_TTS_MODEL and SPORE_VOCODER.
 """
@@ -19,7 +19,7 @@ import wave
 
 import pytest
 
-BIN = os.environ.get("SPORED_ENGINES")
+BIN = os.environ.get("SPORE_ENGINES_BIN")
 ASR = os.environ.get("SPORE_ASR_MODEL")
 LLM = os.environ.get("SPORE_VOICE_LLM")
 SAMPLE = os.environ.get("SPORE_ASR_SAMPLE")
@@ -58,7 +58,7 @@ GPU = ["--gpu"] if os.environ.get("SPORE_ENGINE_GPU") == "1" else []
 
 
 def serve(*args):
-    p = subprocess.Popen([BIN, "--port", "0", *GPU, *args], stdout=subprocess.PIPE, text=True)
+    p = subprocess.Popen([BIN, "serve", "--port", "0", *GPU, *args], stdout=subprocess.PIPE, text=True)
     line = p.stdout.readline()
     assert "listening" in line, line
     return p, int(line.rsplit(":", 1)[1])
@@ -73,7 +73,7 @@ def tts_args():
 # TTS model do not fit an 8 GiB GPU, and ggml aborts on CUDA OOM.
 @pytest.fixture
 def port():
-    p, port = serve("--model", LLM, "--ctx", "2048", "--asr", ASR, *tts_args())
+    p, port = serve("--model", LLM, "--ctx-size", "2048", "--asr", ASR, *tts_args())
     yield port
     p.terminate()
     assert p.wait(timeout=30) == 0
@@ -256,6 +256,37 @@ def test_spoken_turn_gets_a_generated_reply(port):
         _spoken_turn(rt)
 
 
+def test_spoken_turn_latency_by_stage(port):
+    """Time each stage from the server's events. Speech before the VAD's
+    decision is appended at once, so the turn's processing starts at
+    speech_stopped; the silence wait itself is `silence_duration_ms`."""
+    silence_ms = 1500  # the speaker pauses for ~1 s between phrases
+    with RT(port) as rt:
+        rt.send(type="session.update", session={
+            "type": "realtime", "instructions": "Reply in one short sentence.",
+            "audio": {"input": {"transcription": {"model": "whisper"},
+                                "turn_detection": {"type": "server_vad", "silence_duration_ms": silence_ms}}}})
+        rt.until("session.updated")
+        rt.append(jfk_24k() + bytes(48000 * 2))
+        marks = ["input_audio_buffer.speech_stopped",
+                 "conversation.item.input_audio_transcription.completed",
+                 "response.output_audio_transcript.delta", "response.output_audio.delta"]
+        at = {}
+        while True:
+            ev = json.loads(rt.ws.recv(timeout=300))
+            assert ev["type"] != "error", ev
+            at.setdefault(ev["type"], time.time())
+            if ev["type"] == "response.done":
+                break
+    assert ev["response"]["status"] == "completed", ev
+    t = [at[m] for m in marks]
+    assert t == sorted(t), dict(zip(marks, t))
+    asr, llm, tts = (b - a for a, b in zip(t, t[1:]))
+    print(f"\nVAD wait {silence_ms / 1000:.2f} s (configured), ASR {asr:.2f} s, "
+          f"LLM to first sentence {llm:.2f} s, TTS{'' if TTS else ' (mock)'} to first audio {tts:.2f} s; "
+          f"speech end to first audio {silence_ms / 1000 + asr + llm + tts:.2f} s")
+
+
 def _spoken_turn(rt):
     rt.send(type="session.update", session={
         "type": "realtime", "output_modalities": ["text"],
@@ -276,3 +307,40 @@ def _spoken_turn(rt):
     stop = next(i for i, e in enumerate(evs) if e["type"] == "input_audio_buffer.speech_stopped")
     print(f"\nreply: {reply!r} (usage {done['usage']['input_tokens']} in / {done['usage']['output_tokens']} out)")
     assert stop < types.index("response.created")
+
+
+# ---- one-shot subcommands ---------------------------------------------------
+
+
+def test_transcribe_subcommand(tmp_path):
+    p = subprocess.run([BIN, "transcribe", "-m", ASR, *GPU, SAMPLE], capture_output=True,
+                       text=True, timeout=300)
+    assert p.returncode == 0, p.stderr
+    assert "ask not what your country can do for you" in " ".join(words(p.stdout))
+    # 24 kHz stereo: resampled and mixed down to whisper's 16 kHz mono
+    mono = struct.unpack(f"<{len(jfk_24k()) // 2}h", jfk_24k())
+    path = tmp_path / "stereo.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(struct.pack(f"<{2 * len(mono)}h", *(s for x in mono for s in (x, x))))
+    p = subprocess.run([BIN, "transcribe", "-m", ASR, *GPU, str(path)], capture_output=True,
+                       text=True, timeout=300)
+    assert p.returncode == 0 and "ask not what your country" in " ".join(words(p.stdout))
+
+
+@needs_tts
+def test_speak_subcommand_round_trips_through_transcribe(tmp_path):
+    out = tmp_path / "out.wav"
+    text = "The quick brown fox jumps over the lazy dog."
+    p = subprocess.run([BIN, "speak", "-m", TTS, "--vocoder", VOCODER, *GPU,
+                        "--tts-speaker-words", "10", "-o", str(out), *text.split()],
+                       capture_output=True, text=True, timeout=300)
+    assert p.returncode == 0, p.stderr
+    with wave.open(str(out)) as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (24000, 1, 2)
+        assert 1.0 < w.getnframes() / 24000 < 6.0
+    p = subprocess.run([BIN, "transcribe", "-m", ASR, *GPU, str(out)], capture_output=True,
+                       text=True, timeout=300)
+    assert words(p.stdout) == words(text), p.stdout

@@ -1,6 +1,16 @@
 # Changelog
 
-## Unrelease
+## Unreleased
+
+## [0.2.0]
+
+- The C API and ABI may change in any 0.x release (README, "Library use"). Tool calls, for one, will extend `spore_llm_msg` and the emit callback.
+
+- `/ws/duplex` in `spore serve` selects the subprotocol `duplex`, so a browser can authenticate there with `openai-insecure-api-key.<token>`. A browser fails a handshake that offers subprotocols and gets none selected. The README now says a route must set `spore_ws_config.protocol` for this.
+
+- `spored` and `spored-engines` are now `spore` and `spore-engines`, one binary with the subcommands `serve`, `transcribe`, `speak`, `token`, `modules` and `version`. `serve` takes llama-server's option names where both have the option, and a link named `llama-server` runs it. llama-server options spore lacks, such as `--jinja`, exit with status 2 instead of being ignored, because ignoring one would silently change the output. Renamed: `--ctx` to `-c`/`--ctx-size`, `--gpu-layers` to `-ngl`, `--slots` to `-np`/`--parallel`, `--static` to `--path`, `--token` to `--api-key`, and spore's `--host` to `--allow-host`. `--host` now takes llama-server's meaning, a listen address, and accepts only loopback or a `.sock` path. `--token-file` is split into `spore token FILE` and `serve --api-key-file FILE`, so a key survives restarts. `--ipv6` is `--host ::1`, and `--modules` is `spore modules`.
+
+- `serve` checks numeric options. Before, `atoi` turned `--ctx 8k` into an 8-token context and `--workers -1` into a failed allocation.
 
 ## [0.1.0]
 

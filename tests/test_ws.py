@@ -160,10 +160,21 @@ def test_cross_site_upgrade_rejected(srv):
 
 
 def test_token_applies_to_upgrade(spawn):
-    srv = spawn("--token", "t")
+    srv = spawn("--api-key", "t")
     assert read_response(handshake(srv))[0] == 401
     s = handshake(srv, extra="Authorization: Bearer t\r\n")
     assert read_response(s, head_only=True)[0] == 101
+
+
+def test_browser_token_needs_a_selected_protocol(spawn):
+    srv = spawn("--api-key", "t")
+    key = "openai-insecure-api-key.t"
+    with websockets.connect(url(srv, "/ws/duplex"), subprotocols=["duplex", key]) as ws:
+        assert ws.subprotocol == "duplex"
+    # Authenticated, but nothing selected: browsers fail this handshake.
+    s = handshake(srv, extra=f"Sec-WebSocket-Protocol: {key}\r\n")
+    status, headers, _ = read_response(s, head_only=True)
+    assert status == 101 and "sec-websocket-protocol" not in headers
 
 
 def test_subprotocol_selected_only_when_offered(srv):
@@ -422,4 +433,4 @@ def test_shutdown_closes_with_1001(spawn):
             ws.recv(timeout=5)
         assert ws.close_code == 1001
     assert srv.proc.wait(timeout=5) == 0
-    assert "spored: GET /ws/echo 101 " in srv.proc.stderr.read()
+    assert "spore: GET /ws/echo 101 " in srv.proc.stderr.read()

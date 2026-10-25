@@ -1,6 +1,7 @@
-/* spored: static files plus the OpenAI-compatible API.
+/* spore serve: static files plus the OpenAI-compatible API.
  * SPDX-License-Identifier: MIT */
 #define _POSIX_C_SOURCE 200809L
+#include "cli.h"
 #include "spore.h"
 #if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
 #include "echo_backend.h"
@@ -23,8 +24,9 @@
 #include "spore_outetts.h"
 #endif
 
+#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -42,7 +44,7 @@ static void on_signal(int sig) {
 
 static void on_access(const spore_access *a, void *ud) {
     (void)ud;
-    fprintf(stderr, "spored: %.*s %.*s %d %llu %lldms%s%s%s\n", (int)a->method.len,
+    fprintf(stderr, "spore: %.*s %.*s %d %llu %lldms%s%s%s\n", (int)a->method.len,
             a->method.ptr ? a->method.ptr : "", (int)a->target.len,
             a->target.ptr ? a->target.ptr : "", a->status,
             (unsigned long long)a->bytes, (long long)a->ms,
@@ -322,7 +324,8 @@ static void on_ws_duplex(spore_req *req, spore_resp *resp, void *ud) {
     /* Callbacks run on this (the loop) thread, so none can fire before
      * this handler returns; d->ws is set before the worker starts. */
     spore_ws_config cfg = {.on_message = duplex_message,
-                           .on_close = duplex_close};
+                           .on_close = duplex_close,
+                           .protocol = "duplex"};
     if (!(d->ws = spore_ws_accept(req, resp, &cfg, d))) {
         pthread_cond_destroy(&d->cv);
         pthread_mutex_destroy(&d->mu);
@@ -377,24 +380,6 @@ static void on_ws_stream(spore_req *req, spore_resp *resp, void *ud) {
 }
 #endif /* SPORE_WITH_WS */
 
-/* Generate a token (32 random bytes, hex) into `out` and write it to `path`
- * with mode 0600. The file is created beside `path` and renamed over it,
- * so an existing file's mode or open descriptors never see the token. */
-static int write_token_file(const char *path, char out[65]) {
-    unsigned char r[32];
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    ssize_t n = fd < 0 ? -1 : read(fd, r, sizeof r);
-    if (fd >= 0) close(fd);
-    if (n != (ssize_t)sizeof r) return -1;
-    for (size_t i = 0; i < sizeof r; i++) snprintf(out + 2 * i, 3, "%02x", r[i]);
-    char tmp[4096];
-    if (snprintf(tmp, sizeof tmp, "%s.XXXXXX", path) >= (int)sizeof tmp) return -1;
-    if ((fd = mkstemp(tmp)) < 0) return -1; /* mode 0600 */
-    int ok = write(fd, out, 64) == 64 && write(fd, "\n", 1) == 1;
-    ok = close(fd) == 0 && ok && rename(tmp, path) == 0;
-    if (!ok) unlink(tmp);
-    return ok ? 0 : -1;
-}
 
 #ifndef SPORE_WITH_LLM
 static void on_health(spore_req *req, spore_resp *resp, void *ud) {
@@ -404,81 +389,109 @@ static void on_health(spore_req *req, spore_resp *resp, void *ud) {
 }
 #endif
 
-static const char *const modules =
-#ifdef SPORE_WITH_WS
-    " ws"
-#endif
+static void serve_usage(FILE *f) {
+    fprintf(f,
+            "usage: spore serve [options]    (a link named llama-server runs this)\n"
+            "  --port N           loopback TCP port (default 8080, 0 = any)\n"
+            "  --host H           127.0.0.1, localhost, ::1, or a Unix socket path ending\n"
+            "                     in .sock; nothing else (see docs/dev/net-security.md)\n"
+            "  --unix PATH        bind a Unix socket instead of TCP\n"
+            "  --api-key KEY      require 'Authorization: Bearer KEY'; other users see KEY in ps\n"
+            "  --api-key-file F   read the key from F (see 'spore token'); print a URL with it\n"
+            "  --origin O         also allow this Origin (repeatable)\n"
+            "  --origins-only     allow only --origin values, not loopback origins\n"
+            "  --allow-host H     also allow this Host name (repeatable); checked on Unix sockets too\n"
+            "  --path DIR         serve static files from DIR at /\n"
 #ifdef SPORE_WITH_LLM
-    " llm"
+            "  --workers N        concurrent backend calls (default 1)\n"
+            "  --queue N          waiting requests before 503 (default 16)\n"
 #endif
-#ifdef SPORE_WITH_REALTIME
-    " realtime"
+            "  --idle-ms N        keep-alive idle timeout (default 30000)\n"
+            "  --request-ms N     deadline to receive a request (default 30000)\n"
+            "  --grace-ms N       on SIGINT/SIGTERM, wait this long for in-flight requests (default 5000)\n"
+            "  --log              print an access log line per request to stderr\n"
+#if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
+            "  -a, --alias NAME   model id reported by /v1/models\n"
 #endif
-    "";
-
-static void too_many(const char *flag) {
-    fprintf(stderr, "spored: at most 15 %s flags\n", flag);
-    exit(2);
-}
-
-static void usage(void) {
-    fprintf(stderr,
-            "usage: spored [options]\n"
-            "  --port N        loopback TCP port (default 8080, 0 = any)\n"
-            "  --ipv6          bind ::1 instead of 127.0.0.1\n"
-            "  --unix PATH     bind a Unix socket instead of TCP\n"
-            "  --token T       require 'Authorization: Bearer T'; other users see T in ps\n"
-            "  --token-file F  generate a token, write it to F (mode 0600), print a URL with it\n"
-            "  --origin O      also allow this Origin (repeatable)\n"
-            "  --origins-only  allow only --origin values, not loopback origins\n"
-            "  --host H        also allow this Host name (repeatable); checked on --unix too\n"
-            "  --static DIR    serve DIR at /\n"
-#ifdef SPORE_WITH_LLM
-            "  --workers N     concurrent backend calls (default 1)\n"
-            "  --queue N       waiting requests before 503 (default 16)\n"
-#endif
-            "  --modules       print the compiled-in modules and exit\n"
-            "  --idle-ms N     keep-alive idle timeout (default 30000)\n"
-            "  --request-ms N  deadline to receive a request (default 30000)\n"
-            "  --grace-ms N    on SIGINT/SIGTERM, wait this long for in-flight requests (default 5000)\n"
-            "  --log           print an access log line per request to stderr\n"
 #if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
-            "  --gpu           offload every engine to the GPU (needs a GPU ggml build)\n"
+            "  --gpu              offload every engine to the GPU (needs a GPU ggml build)\n"
 #endif
 #ifdef SPORE_WITH_LLAMA
-            "  --model PATH    GGUF model for the llama.cpp backend\n"
-            "  --ctx N         context size (default 4096; the model's own with --embedding)\n"
-            "  --gpu-layers N  layers to offload (default 0)\n"
-            "  --embedding     serve /v1/embeddings instead of completions\n"
-            "  --slots N       prompt-cache slots for interleaved conversations (default 4)\n"
+            "  -m, --model PATH   GGUF model for the llama.cpp backend\n"
+            "  -c, --ctx-size N   context size (default 4096; 0 = the model's own, the default\n"
+            "                     with --embedding)\n"
+            "  -ngl, --n-gpu-layers N  layers to offload, or 'all' (default 0)\n"
+            "  -t, --threads N    generation threads (default: llama.cpp's)\n"
+            "  --embedding        serve /v1/embeddings instead of completions\n"
+            "  -np, --parallel N  prompt-cache slots for interleaved conversations (default 4)\n"
 #endif
 #ifdef SPORE_WITH_WHISPER
-            "  --asr PATH      whisper.cpp model for /v1/realtime speech input\n"
-            "  --asr-lang L    spoken language, or auto (default en)\n"
+            "  --asr PATH         whisper.cpp model for /v1/realtime speech input\n"
+            "  --asr-lang L       spoken language, or auto (default en)\n"
 #endif
 #ifdef SPORE_WITH_OUTETTS
-            "  --tts PATH      OuteTTS 0.2/0.3 model for /v1/realtime speech output\n"
-            "  --vocoder PATH  WavTokenizer model for --tts\n"
+            "  --tts PATH         OuteTTS 0.2/0.3 model for /v1/realtime speech output\n"
+            "  --vocoder PATH     WavTokenizer model for --tts\n"
             "  --tts-speaker-words N  shorter speaker profile, faster (default 30)\n"
-            "  --tts-chunk N   stream N codes per chunk (default 40); -1: whole sentences\n"
+            "  --tts-chunk N      stream N codes per chunk (default 40); -1: whole sentences\n"
 #endif
 #ifdef SPORE_WITH_LLM
             "Without --model the echo test backend answers.\n"
 #endif
             );
-    exit(2);
 }
 
-int main(int argc, char **argv) {
+/* --host takes llama-server's meaning, a listen address, restricted to the
+ * addresses spore can bind. */
+static void set_host(spore_config *cfg, const char *v) {
+    size_t n = strlen(v);
+    cfg->unix_path = NULL;
+    if (!strcmp(v, "127.0.0.1") || !strcmp(v, "localhost")) {
+        cfg->ipv6 = 0;
+    } else if (!strcmp(v, "::1") || !strcmp(v, "[::1]")) {
+        cfg->ipv6 = 1;
+    } else if (n > 5 && !strcmp(v + n - 5, ".sock")) {
+        cfg->unix_path = v;
+    } else {
+        fprintf(stderr, "spore: --host %s: spore listens only on 127.0.0.1, ::1 or a Unix "
+                        "socket; to reach it from elsewhere see docs/dev/net-security.md\n", v);
+        exit(2);
+    }
+}
+
+/* One key, as written by `spore token`: a single line without spaces. */
+static void read_key_file(const char *path, char *key, size_t cap) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "spore: --api-key-file %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    size_t n = fread(key, 1, cap - 1, f);
+    int more = fgetc(f) != EOF;
+    fclose(f);
+    while (n && isspace((unsigned char)key[n - 1])) n--;
+    key[n] = '\0';
+    int ok = n && !more;
+    for (size_t i = 0; i < n; i++) ok &= !isspace((unsigned char)key[i]) && key[i] != ',';
+    if (!ok) {
+        fprintf(stderr, "spore: --api-key-file %s: expected one key on one line\n", path);
+        exit(2);
+    }
+}
+
+int serve_main(int argc, char **argv) {
     spore_config cfg = {.port = 8080};
 #ifdef SPORE_WITH_LLM
     spore_llm_config lcfg = {0};
 #endif
+#if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
+    const char *alias = NULL;
+#endif
     const char *static_dir = NULL, *origins[16] = {0}, *hosts[16] = {0};
-    const char *token_file = NULL;
+    const char *key_file = NULL;
     int grace_ms = 5000;
     size_t n_hosts = 0;
-    char token[65];
+    char key[1024];
     size_t n_origins = 0;
 #ifdef SPORE_WITH_LLAMA
     spore_llama_config mcfg = {.n_ctx = -1, .n_slots = 4};
@@ -495,70 +508,76 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
-#define ARG(name) (strcmp(a, name) == 0 && (v || (usage(), 0)) && ++i)
-        if (ARG("--port")) {
-            char *end;
-            long port = strtol(v, &end, 10);
-            if (*end || end == v || port < 0 || port > 65535) {
-                fprintf(stderr, "spored: --port must be 0..65535\n");
-                return 2;
-            }
-            cfg.port = (uint16_t)port;
-        }
-        else if (strcmp(a, "--ipv6") == 0) cfg.ipv6 = 1;
-        else if (ARG("--unix")) cfg.unix_path = v;
-        else if (ARG("--token")) cfg.token = v;
-        else if (ARG("--token-file")) token_file = v;
-        else if (ARG("--origin") && (n_origins < 15 || (too_many("--origin"), 0)))
-            origins[n_origins++] = v;
-        else if (strcmp(a, "--origins-only") == 0) cfg.origins_only = 1;
-        else if (ARG("--host") && (n_hosts < 15 || (too_many("--host"), 0)))
-            hosts[n_hosts++] = v;
-        else if (ARG("--static")) static_dir = v;
-#ifdef SPORE_WITH_LLM
-        else if (ARG("--workers")) lcfg.workers = (size_t)atoi(v);
-        else if (ARG("--queue")) lcfg.queue = (size_t)atoi(v);
-#endif
-        else if (strcmp(a, "--modules") == 0) {
-            printf("core%s\n", modules);
+        if (CLI_FLAG("-h", "--help")) {
+            serve_usage(stdout);
             return 0;
         }
-        else if (ARG("--idle-ms")) cfg.idle_ms = atoi(v);
-        else if (ARG("--request-ms")) cfg.request_ms = atoi(v);
-        else if (ARG("--grace-ms")) grace_ms = atoi(v);
-        else if (strcmp(a, "--log") == 0) cfg.log = on_access;
+        else if (CLI_ARG("--port")) cfg.port = (uint16_t)cli_long(a, v, 0, 65535);
+        else if (CLI_ARG("--host")) set_host(&cfg, v);
+        else if (CLI_ARG("--unix")) cfg.unix_path = v;
+        else if (CLI_ARG("--api-key")) {
+            if (strchr(v, ',')) {
+                fprintf(stderr, "spore: --api-key: spore accepts one key\n");
+                return 2;
+            }
+            cfg.token = v;
+        }
+        else if (CLI_ARG("--api-key-file")) key_file = v;
+        else if (CLI_ARG("--origin")) {
+            if (n_origins == 15) cli_too_many(a, 15);
+            origins[n_origins++] = v;
+        }
+        else if (CLI_FLAG("--origins-only")) cfg.origins_only = 1;
+        else if (CLI_ARG("--allow-host")) {
+            if (n_hosts == 15) cli_too_many(a, 15);
+            hosts[n_hosts++] = v;
+        }
+        else if (CLI_ARG("--path")) static_dir = v;
+#ifdef SPORE_WITH_LLM
+        else if (CLI_ARG("--workers")) lcfg.workers = (size_t)cli_long(a, v, 1, 256);
+        else if (CLI_ARG("--queue")) lcfg.queue = (size_t)cli_long(a, v, 1, 65536);
+#endif
+        else if (CLI_ARG("--idle-ms")) cfg.idle_ms = (int)cli_long(a, v, 1, INT_MAX);
+        else if (CLI_ARG("--request-ms")) cfg.request_ms = (int)cli_long(a, v, 1, INT_MAX);
+        else if (CLI_ARG("--grace-ms")) grace_ms = (int)cli_long(a, v, 0, INT_MAX);
+        else if (CLI_FLAG("--log")) cfg.log = on_access;
+#if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
+        else if (CLI_ARG("-a", "--alias")) alias = v;
+#endif
 #if defined(SPORE_WITH_LLAMA) || defined(SPORE_WITH_WHISPER)
-        else if (strcmp(a, "--gpu") == 0) gpu = 1;
+        else if (CLI_FLAG("--gpu")) gpu = 1;
 #endif
 #ifdef SPORE_WITH_LLAMA
-        else if (ARG("--model")) mcfg.model_path = v;
-        else if (ARG("--ctx")) mcfg.n_ctx = atoi(v);
-        else if (ARG("--gpu-layers")) mcfg.n_gpu_layers = atoi(v);
-        else if (strcmp(a, "--embedding") == 0) mcfg.embedding = 1;
-        else if (ARG("--slots")) mcfg.n_slots = atoi(v);
+        else if (CLI_ARG("-m", "--model")) mcfg.model_path = v;
+        else if (CLI_ARG("-c", "--ctx-size")) mcfg.n_ctx = (int)cli_long(a, v, 0, 1L << 24);
+        else if (CLI_ARG("-ngl", "--gpu-layers", "--n-gpu-layers"))
+            mcfg.n_gpu_layers = strcmp(v, "all") ? (int)cli_long(a, v, 0, 999) : 999;
+        else if (CLI_ARG("-t", "--threads")) mcfg.n_threads = (int)cli_long(a, v, 1, 1024);
+        else if (CLI_FLAG("--embedding", "--embeddings")) mcfg.embedding = 1;
+        else if (CLI_ARG("-np", "--parallel")) mcfg.n_slots = (int)cli_long(a, v, 1, 64);
 #endif
 #ifdef SPORE_WITH_WHISPER
-        else if (ARG("--asr")) wcfg.model_path = v;
-        else if (ARG("--asr-lang")) wcfg.language = v;
+        else if (CLI_ARG("--asr")) wcfg.model_path = v;
+        else if (CLI_ARG("--asr-lang")) wcfg.language = v;
 #endif
 #ifdef SPORE_WITH_OUTETTS
-        else if (ARG("--tts")) tcfg.model_path = v;
-        else if (ARG("--vocoder")) tcfg.vocoder_path = v;
-        else if (ARG("--tts-speaker-words")) tcfg.speaker_words = atoi(v);
-        else if (ARG("--tts-chunk")) tcfg.chunk_codes = atoi(v);
+        else if (CLI_ARG("--tts")) tcfg.model_path = v;
+        else if (CLI_ARG("--vocoder")) tcfg.vocoder_path = v;
+        else if (CLI_ARG("--tts-speaker-words"))
+            tcfg.speaker_words = (int)cli_long(a, v, 1, 30);
+        else if (CLI_ARG("--tts-chunk")) tcfg.chunk_codes = (int)cli_long(a, v, -1, 10000);
 #endif
-        else usage();
-#undef ARG
+        else cli_unknown("serve", a);
     }
     cfg.origins = origins;
     if (n_hosts) cfg.hosts = hosts;
-    if (token_file) {
-        if (cfg.token) usage(); /* one or the other */
-        if (write_token_file(token_file, token)) {
-            fprintf(stderr, "spored: cannot write %s: %s\n", token_file, strerror(errno));
-            return 1;
+    if (key_file) {
+        if (cfg.token) {
+            fprintf(stderr, "spore: --api-key and --api-key-file are exclusive\n");
+            return 2;
         }
-        cfg.token = token;
+        read_key_file(key_file, key, sizeof key);
+        cfg.token = key;
     }
 #ifdef SPORE_WITH_LLAMA
     if (mcfg.n_ctx < 0) mcfg.n_ctx = mcfg.embedding ? 0 : 4096;
@@ -578,30 +597,33 @@ int main(int argc, char **argv) {
     spore_llm_backend *lb = NULL;
     if (mcfg.model_path) {
         if (!(lb = spore_llama_new(&mcfg))) {
-            fprintf(stderr, "spored: cannot load %s\n", mcfg.model_path);
+            fprintf(stderr, "spore: cannot load %s\n", mcfg.model_path);
             return 1;
         }
         be = *lb;
     }
 #endif
+#if defined(SPORE_WITH_LLM) || defined(SPORE_WITH_REALTIME)
+    if (alias) be.model = alias;
+#endif
 #ifdef SPORE_WITH_WHISPER
     spore_whisper *asr = NULL;
     if (wcfg.model_path && !(asr = spore_whisper_new(&wcfg))) {
-        fprintf(stderr, "spored: cannot load %s\n", wcfg.model_path);
+        fprintf(stderr, "spore: cannot load %s\n", wcfg.model_path);
         return 1;
     }
 #endif
 #ifdef SPORE_WITH_OUTETTS
     spore_outetts *tts = NULL;
     if (tcfg.model_path && (!tcfg.vocoder_path || !(tts = spore_outetts_new(&tcfg)))) {
-        fprintf(stderr, "spored: cannot load %s with vocoder %s\n", tcfg.model_path,
+        fprintf(stderr, "spore: cannot load %s with vocoder %s\n", tcfg.model_path,
                 tcfg.vocoder_path ? tcfg.vocoder_path : "(none; use --vocoder)");
         return 1;
     }
 #endif
 
     if (!(g_srv = spore_new(&cfg))) {
-        fprintf(stderr, "spored: %s\n", strerror(errno));
+        fprintf(stderr, "spore: %s\n", strerror(errno));
         return 1;
     }
     int err = 0;
@@ -636,7 +658,7 @@ int main(int argc, char **argv) {
            (static_dir &&
             spore_route(g_srv, "GET", "/*", on_static, (void *)static_dir));
     if (err) {
-        fprintf(stderr, "spored: setup failed\n");
+        fprintf(stderr, "spore: setup failed\n");
         return 1;
     }
 
@@ -644,14 +666,14 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     if (cfg.unix_path)
-        printf("spored listening on unix:%s\n", cfg.unix_path);
+        printf("spore listening on unix:%s\n", cfg.unix_path);
     else
-        printf("spored listening on http://%s:%u\n",
+        printf("spore listening on http://%s:%u\n",
                cfg.ipv6 ? "[::1]" : "127.0.0.1", spore_port(g_srv));
     /* The fragment never reaches a server, a log or a Referer. */
-    if (token_file && !cfg.unix_path)
+    if (key_file && !cfg.unix_path)
         printf("open http://%s:%u/#token=%s\n", cfg.ipv6 ? "[::1]" : "localhost",
-               spore_port(g_srv), token);
+               spore_port(g_srv), key);
     fflush(stdout);
 
     int rc = spore_run(g_srv);

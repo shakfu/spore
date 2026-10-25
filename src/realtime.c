@@ -1661,10 +1661,6 @@ static int speech_emit(void *vsp, const float *pcm, size_t n) {
     return sp->dead;
 }
 
-static void put_le(unsigned char *p, uint32_t v, int bytes) {
-    for (int i = 0; i < bytes; i++) p[i] = (unsigned char)(v >> (8 * i));
-}
-
 /* 16-bit mono WAV at RATE from float samples at `rate`. */
 static int wav_reply(spore_resp *resp, const float *pcm, size_t n, int rate) {
     size_t m = 0;
@@ -1675,18 +1671,7 @@ static int wav_reply(spore_resp *resp, const float *pcm, size_t n, int rate) {
         return -1;
     }
     uint32_t data = (uint32_t)(m * 2);
-    memcpy(w, "RIFF", 4);
-    put_le(w + 4, 36 + data, 4);
-    memcpy(w + 8, "WAVEfmt ", 8);
-    put_le(w + 16, 16, 4);        /* fmt chunk size */
-    put_le(w + 20, 1, 2);         /* PCM */
-    put_le(w + 22, 1, 2);         /* mono */
-    put_le(w + 24, RATE, 4);
-    put_le(w + 28, RATE * 2, 4);  /* byte rate */
-    put_le(w + 32, 2, 2);         /* block align */
-    put_le(w + 34, 16, 2);        /* bits per sample */
-    memcpy(w + 36, "data", 4);
-    put_le(w + 40, data, 4);
+    spore__wav_header(w, data, RATE);
     spore__float_to_pcm16le(r, m, w + 44);
     free(r);
     spore_reply(resp, 200, "audio/wav", w, 44 + (size_t)data);
