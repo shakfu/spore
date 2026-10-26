@@ -89,10 +89,9 @@ def test_host_binds_loopback(host, addr):
         assert p.wait(timeout=5) == 0
 
 
-def test_host_ending_in_sock_is_a_unix_socket(spawn, tmp_path):
-    path = tmp_path / "s.sock"
-    srv = spawn("--host", str(path))
-    assert srv.unix == str(path)
+def test_host_ending_in_sock_is_a_unix_socket(spawn, sock_path):
+    srv = spawn("--host", sock_path)
+    assert srv.unix == sock_path
     assert request(srv, get())[0] == 200
 
 
