@@ -40,7 +40,8 @@ typedef struct {
     spore_str target;   /* raw request-target, e.g. "/a%20b?x=1" */
     spore_str path;     /* target before '?', not percent-decoded */
     spore_str query;    /* target after '?', empty if absent */
-    spore_str tail;     /* path remainder matched by a trailing '*' route */
+    spore_str tail;     /* path remainder matched by a trailing '*' route;
+                           ptr is NULL on an exact route */
     int minor;          /* HTTP/1.<minor> */
     spore_header headers[SPORE_MAX_HEADERS];
     size_t n_headers;

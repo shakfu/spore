@@ -228,6 +228,8 @@ Browsers cannot set `Authorization` on a WebSocket. When `spore_config.token` is
 
 `spore_rt_new(srv, &backend, &cfg)` serves `GET /v1/realtime` with the GA event protocol of the OpenAI Realtime API. The official SDK connects unmodified with `client.realtime.connect()`. Browsers connect with the subprotocols `realtime` and `openai-insecure-api-key.<token>`.
 
+At most `spore_rt_config.max_sessions` (4) sessions run at once; more get 503. Each session can hold 600 s of input audio, about 125 MB at its peak during transcription.
+
 Speech to speech runs as a pipeline of three blocking backend calls, in order on a per-session worker thread:
 
 | Step | Backend call | Audio |

@@ -7,6 +7,7 @@
 #include "internal.h"
 #include "spore_json.h"
 
+#include <errno.h>
 #include <locale.h>
 #include <stdatomic.h>
 #include <math.h>
@@ -475,6 +476,18 @@ static void test_rt_asr(void) {
         spore__rt_close(s);
     }
     spore_rt_free(rt);
+
+    /* At max_sessions, a new session is refused until one closes. */
+    rt = spore__rt_detached(&be, &(spore_rt_config){.max_sessions = 1});
+    s = rt ? spore__rt_open(rt) : NULL;
+    CHECK(s != NULL);
+    errno = 0;
+    CHECK(rt && spore__rt_open(rt) == NULL && errno == EBUSY);
+    if (s) spore__rt_close(s);
+    s = rt ? spore__rt_open(rt) : NULL;
+    CHECK(s != NULL);
+    if (s) spore__rt_close(s);
+    spore_rt_free(rt);
 }
 #endif
 
@@ -527,10 +540,44 @@ static void test_unroute(void) {
     spore_free(srv);
 }
 
+static void serve_ud(spore_req *req, spore_resp *resp, void *ud) {
+    spore_serve_dir(req, resp, ud);
+}
+
+static void tail_null(spore_req *req, spore_resp *resp, void *ud) {
+    (void)ud;
+    spore_reply(resp, req->tail.ptr ? 500 : 200, "text/plain", "", 0);
+}
+
+/* An exact route serves req->path; a prefix route serves req->tail. */
+static void test_serve_dir_routes(void) {
+    char root[] = "/tmp/spore-unit-XXXXXX", file[64];
+    CHECK(mkdtemp(root) != NULL);
+    snprintf(file, sizeof file, "%s/index.html", root);
+    FILE *f = fopen(file, "w");
+    CHECK(f != NULL);
+    if (f) fputs("hi\n", f), fclose(f);
+    spore_server *srv = spore_new(&(spore_config){0});
+    CHECK(srv != NULL);
+    if (srv) {
+        CHECK(spore_route(srv, "GET", "/index.html", serve_ud, root) == 0);
+        CHECK(spore_route(srv, "GET", "/files/*", serve_ud, root) == 0);
+        CHECK(spore_route(srv, "GET", "/exact", tail_null, NULL) == 0);
+        CHECK(get_status(srv, "/index.html") == 200);
+        CHECK(get_status(srv, "/files/index.html") == 200);
+        CHECK(get_status(srv, "/files/") == 200);
+        CHECK(get_status(srv, "/exact") == 200);
+        spore_free(srv);
+    }
+    unlink(file);
+    rmdir(root);
+}
+
 int main(void) {
     test_parse_head();
     test_dechunk();
     test_unroute();
+    test_serve_dir_routes();
     test_tokens_and_hosts();
     test_url();
     test_json_read();

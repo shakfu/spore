@@ -13,6 +13,7 @@
 #include "spore_json.h"
 #include "spore_ws.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -27,6 +28,7 @@
 #define MAX_EVENT (16u << 20)      /* OpenAI caps an append at 15 MiB */
 #define SPEECH_MAX_INPUT 4096      /* bytes; OpenAI allows 4096 characters */
 #define SPEECH_MAX_JOBS 4          /* concurrent /v1/audio/speech requests */
+#define MAX_SESSIONS 4             /* default spore_rt_config.max_sessions */
 
 enum { ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT };
 enum { C_INPUT_TEXT, C_INPUT_AUDIO, C_OUTPUT_TEXT, C_OUTPUT_AUDIO };
@@ -89,6 +91,8 @@ struct spore_rt {
     pthread_cond_t cv;
     int live;             /* sessions and speech jobs not yet freed */
     int speaking;         /* speech jobs running */
+    int sessions;         /* sessions not yet freed */
+    int max_sessions;
 };
 
 typedef struct spore__rt_sess {
@@ -177,7 +181,8 @@ static void send_error(session *s, const char *code, const char *msg,
                        const char *param, const char *event_id) {
     spore_buf b = {0};
     ev_begin(&b, "error");
-    spore_buf_puts(&b, ",\"error\":{\"type\":\"invalid_request_error\",\"code\":");
+    spore_buf_printf(&b, ",\"error\":{\"type\":\"%s\",\"code\":",
+                     strcmp(code, "server_error") ? "invalid_request_error" : "server_error");
     jstr(&b, code);
     spore_buf_puts(&b, ",\"message\":");
     jstr(&b, msg);
@@ -311,6 +316,23 @@ static long find_item(session *s, const char *id) {
     return -1;
 }
 
+/* Used by an item, the item announced by speech_started, or the active
+ * response's output item. */
+static int id_taken(session *s, const char *id) {
+    return find_item(s, id) >= 0 || (s->pending_id && !strcmp(s->pending_id, id)) ||
+           (s->active && !strcmp(s->active->item_id, id));
+}
+
+/* A server item id no client item already uses: client ids are free-form. */
+static char *item_id_new(session *s) {
+    char *id = new_id("item");
+    while (id && id_taken(s, id)) {
+        free(id);
+        id = new_id("item");
+    }
+    return id;
+}
+
 /* Insert at `pos`; returns 0, or -1 on allocation failure. */
 static int insert_item(session *s, size_t pos, item *it) {
     if (s->n_items == s->cap_items) {
@@ -359,7 +381,13 @@ static void response_free(response *r) {
     free(r);
 }
 
-/* Queue a response. Returns 0, or -1 if one is already active. */
+static void send_response_event(session *s, const char *type, response *r,
+                                const char *status, const char *detail_type,
+                                const char *reason, item *out,
+                                const spore_llm_usage *u);
+
+/* Queue a response and announce it, so a client sees the response that
+ * blocks a second response.create. Returns 0, or -1 if one is active. */
 static int start_response(session *s, int audio, const char *instructions,
                           long max_tokens) {
     if (s->active) return -1;
@@ -371,13 +399,21 @@ static int start_response(session *s, int audio, const char *instructions,
         return -1;
     }
     id_into(r->id, "resp");
-    id_into(r->item_id, "item");
+    char *iid = item_id_new(s);
+    if (!iid) {
+        response_free(r);
+        free(j);
+        return -1;
+    }
+    snprintf(r->item_id, sizeof r->item_id, "%s", iid);
+    free(iid);
     r->audio = audio;
     r->max_tokens = max_tokens;
     j->kind = J_RESPOND;
     j->r = r;
     s->active = r;
     push_job(s, j);
+    send_response_event(s, "response.created", r, "in_progress", NULL, NULL, NULL, NULL);
     return 0;
 }
 
@@ -468,7 +504,7 @@ static void vad(session *s) {
             s->silence = 0;
             s->speech_start = start;
             free(s->pending_id);
-            s->pending_id = new_id("item");
+            s->pending_id = item_id_new(s);
             spore_buf b = {0};
             ev_begin(&b, "input_audio_buffer.speech_started");
             spore_buf_printf(&b, ",\"audio_start_ms\":%ld,\"item_id\":", MS(start));
@@ -519,6 +555,7 @@ typedef struct {
     session *s;
     spore_json *d;
     const char *event_id;
+    long pcm_bytes; /* append: 'audio' decoded in place before locking, or -1 */
 } ctx;
 
 #define ERR(code, msg, param)                                     \
@@ -656,7 +693,7 @@ static void on_append(ctx *c, const spore_jnode *ev) {
     const spore_jnode *a = get(c, ev, "audio");
     if (!s->rt->be.asr.fn) ERR("unsupported", "this server has no speech recognition", "audio");
     if (!is_str(a)) ERR("invalid_value", "'audio' must be a base64 string", "audio");
-    long bytes = spore__base64_decode((char *)a->str, a->len);
+    long bytes = c->pcm_bytes;
     if (bytes < 0 || bytes % 2) ERR("invalid_value", "'audio' is not base64 16-bit PCM", "audio");
     size_t n = (size_t)bytes / 2;
     if (s->len + s->queued + n > s->rt->max_input)
@@ -681,7 +718,7 @@ static void on_append(ctx *c, const spore_jnode *ev) {
 static void on_commit(ctx *c) {
     session *s = c->s;
     if (!s->len) ERR("input_audio_buffer_commit_empty", "the input audio buffer is empty", NULL);
-    char *id = s->pending_id ? s->pending_id : new_id("item");
+    char *id = s->pending_id ? s->pending_id : item_id_new(s);
     s->pending_id = NULL;
     s->speaking = 0;
     s->onset = 0;
@@ -692,6 +729,8 @@ static void on_commit(ctx *c) {
 
 static void on_clear(ctx *c) {
     session *s = c->s;
+    free(s->pending_id); /* the cleared speech's id */
+    s->pending_id = NULL;
     s->base = s->total;
     s->vad_pos = s->total;
     s->len = 0;
@@ -732,7 +771,7 @@ static void on_item_create(ctx *c, const spore_jnode *ev) {
     const spore_jnode *id = get(c, o, "id");
     if (id && (!is_str(id) || !id->len || id->len > 64))
         ERR("invalid_value", "item.id must be a string of 1..64 bytes", "item.id");
-    if (is_str(id) && find_item(s, id->str) >= 0)
+    if (is_str(id) && id_taken(s, id->str))
         ERR("invalid_value", "an item with this id exists", "item.id");
 
     /* Content: join text parts; at most one audio part to transcribe. */
@@ -792,7 +831,7 @@ static void on_item_create(ctx *c, const spore_jnode *ev) {
         }
     }
     item *it = bad ? NULL : calloc(1, sizeof *it);
-    char *iid = it ? (is_str(id) ? dup0(id->str) : new_id("item")) : NULL;
+    char *iid = it ? (is_str(id) ? dup0(id->str) : item_id_new(s)) : NULL;
     if (bad || !it || !iid || text.err || insert_item(s, pos, it)) {
         free(it);
         free(iid);
@@ -923,17 +962,27 @@ static void on_message(spore_ws *ws, int type, char *data, size_t len,
     (void)ws;
     session *s = ud;
     spore_json d = {0};
+    ctx cx = {s, &d, NULL, -1}, *c = &cx;
+    /* Parse and decode before locking: an append can be 16 MiB, and the
+     * worker needs s->mu to send each audio delta. */
+    int bad = type != SPORE_WS_TEXT ? 1
+            : spore_json_parse(&d, data, len) || spore_json_root(&d)->type != SPORE_JOBJ ? 2
+            : 0;
+    const spore_jnode *ev = bad ? NULL : spore_json_root(&d);
+    const spore_jnode *t = get(c, ev, "type");
+    const char *ty = is_str(t) ? t->str : "";
+    if (!strcmp(ty, "input_audio_buffer.append")) {
+        const spore_jnode *a = get(c, ev, "audio");
+        if (is_str(a)) c->pcm_bytes = spore__base64_decode((char *)a->str, a->len);
+    }
     pthread_mutex_lock(&s->mu);
-    ctx cx = {s, &d, NULL}, *c = &cx;
-    if (type != SPORE_WS_TEXT) {
+    if (bad == 1) {
         send_error(s, "invalid_event", "events must be JSON text frames", NULL, NULL);
-    } else if (spore_json_parse(&d, data, len) || spore_json_root(&d)->type != SPORE_JOBJ) {
+    } else if (bad) {
         send_error(s, "invalid_json", "the event is not a JSON object", NULL, NULL);
     } else {
-        const spore_jnode *ev = spore_json_root(&d);
-        const spore_jnode *t = get(c, ev, "type"), *eid = get(c, ev, "event_id");
+        const spore_jnode *eid = get(c, ev, "event_id");
         if (is_str(eid)) c->event_id = eid->str;
-        const char *ty = is_str(t) ? t->str : "";
         if (!strcmp(ty, "session.update")) on_session_update(c, ev);
         else if (!strcmp(ty, "input_audio_buffer.append")) on_append(c, ev);
         else if (!strcmp(ty, "input_audio_buffer.commit")) on_commit(c);
@@ -1307,7 +1356,6 @@ static void run_response(session *s, response *r) {
     size_t n_msgs = 0;
 
     pthread_mutex_lock(&s->mu);
-    send_response_event(s, "response.created", r, "in_progress", NULL, NULL, NULL, NULL);
     item *it = calloc(1, sizeof *it);
     if (it && (it->id = dup0(r->item_id)) && !insert_item(s, s->n_items, it)) {
         it->role = ROLE_ASSISTANT;
@@ -1451,6 +1499,14 @@ static void run_response(session *s, response *r) {
 
 /* ---- session lifecycle ------------------------------------------------------ */
 
+/* Give back the slot session_new() took. */
+static void session_leave(spore_rt *rt) {
+    pthread_mutex_lock(&rt->mu);
+    rt->sessions--;
+    if (!--rt->live) pthread_cond_broadcast(&rt->cv);
+    pthread_mutex_unlock(&rt->mu);
+}
+
 static void session_unref(session *s) {
     pthread_mutex_lock(&s->mu);
     int n = --s->refs;
@@ -1478,9 +1534,7 @@ static void session_unref(session *s) {
     pthread_mutex_destroy(&s->mu);
     spore_rt *rt = s->rt;
     free(s);
-    pthread_mutex_lock(&rt->mu);
-    if (!--rt->live) pthread_cond_broadcast(&rt->cv);
-    pthread_mutex_unlock(&rt->mu);
+    session_leave(rt);
 }
 
 /* Run queued jobs until none is left (wait == 0) or the session closes. */
@@ -1523,10 +1577,22 @@ static void on_close(spore_ws *ws, int code, void *ud) {
 }
 
 /* A session with two references (loop and worker) and no connection.
- * Returns NULL on allocation failure. */
+ * Returns NULL with errno EBUSY at max_sessions, or ENOMEM. */
 static session *session_new(spore_rt *rt, const char *model) {
+    pthread_mutex_lock(&rt->mu);
+    int full = rt->sessions >= rt->max_sessions;
+    if (!full) rt->sessions++, rt->live++;
+    pthread_mutex_unlock(&rt->mu);
+    if (full) {
+        errno = EBUSY;
+        return NULL;
+    }
     session *s = calloc(1, sizeof *s);
-    if (!s) return NULL;
+    if (!s) {
+        session_leave(rt);
+        errno = ENOMEM;
+        return NULL;
+    }
     s->rt = rt;
     s->refs = 2;
     pthread_mutex_init(&s->mu, NULL);
@@ -1546,15 +1612,25 @@ static session *session_new(spore_rt *rt, const char *model) {
     c->silence_ms = 500;
     c->create_response = c->interrupt_response = 1;
     c->max_tokens = -1;
-    pthread_mutex_lock(&rt->mu);
-    rt->live++;
-    pthread_mutex_unlock(&rt->mu);
     if (!s->model || !c->instructions || !c->voice) {
         s->refs = 1;
         session_unref(s);
+        errno = ENOMEM;
         return NULL;
     }
     return s;
+}
+
+/* An OpenAI-shaped error body. */
+static void http_error(spore_resp *resp, int status, const char *msg) {
+    spore_buf b = {0};
+    spore_buf_puts(&b, "{\"error\":{\"message\":");
+    spore_json_str(&b, msg, strlen(msg));
+    spore_buf_printf(&b, ",\"type\":\"%s\",\"code\":%d}}",
+                     status < 500 ? "invalid_request_error" : "server_error", status);
+    if (b.err) spore_reply(resp, 500, "text/plain", "oom\n", 4);
+    else spore_reply(resp, status, "application/json", b.ptr, b.len);
+    spore_buf_free(&b);
 }
 
 static const spore_ws_config ws_config = {.on_message = on_message,
@@ -1568,7 +1644,8 @@ static void on_realtime(spore_req *req, spore_resp *resp, void *ud) {
                                                  sizeof model) > 0
                                      ? model : NULL);
     if (!s) {
-        spore_reply(resp, 500, "text/plain", "oom\n", 4);
+        if (errno == EBUSY) http_error(resp, 503, "too many realtime sessions");
+        else http_error(resp, 500, "out of memory");
         return;
     }
     if (!(s->ws = spore_ws_accept(req, resp, &ws_config, s))) {
@@ -1599,6 +1676,7 @@ spore_rt *spore__rt_detached(const spore_rt_backend *be,
     rt->instructions = dup0(cfg && cfg->instructions ? cfg->instructions : "");
     rt->voice = dup0(cfg && cfg->voice ? cfg->voice : "marin");
     rt->max_input = (size_t)(cfg && cfg->max_input_s > 0 ? cfg->max_input_s : 600) * RATE;
+    rt->max_sessions = cfg && cfg->max_sessions > 0 ? cfg->max_sessions : MAX_SESSIONS;
     pthread_mutex_init(&rt->mu, NULL);
     pthread_cond_init(&rt->cv, NULL);
     if (!rt->instructions || !rt->voice) {
@@ -1619,17 +1697,6 @@ typedef struct {
     float *pcm;           /* wav: every sample at tts.rate */
     size_t n, cap;
 } speech;
-
-static void speech_error(spore_resp *resp, int status, const char *msg) {
-    spore_buf b = {0};
-    spore_buf_puts(&b, "{\"error\":{\"message\":");
-    spore_json_str(&b, msg, strlen(msg));
-    spore_buf_printf(&b, ",\"type\":\"%s\",\"code\":%d}}",
-                     status < 500 ? "invalid_request_error" : "server_error", status);
-    if (b.err) spore_reply(resp, 500, "text/plain", "oom\n", 4);
-    else spore_reply(resp, status, "application/json", b.ptr, b.len);
-    spore_buf_free(&b);
-}
 
 static int speech_emit(void *vsp, const float *pcm, size_t n) {
     speech *sp = vsp;
@@ -1697,10 +1764,10 @@ static void *speech_thread(void *arg) {
     if (sp->begun || spore_closed(sp->resp)) {
         spore_end(sp->resp); /* a failure mid-stream can only truncate */
     } else if (failed || sp->dead) {
-        speech_error(sp->resp, 500, "speech synthesis failed");
+        http_error(sp->resp, 500, "speech synthesis failed");
     } else if (sp->wav) {
         if (wav_reply(sp->resp, sp->pcm, sp->n, tts->rate))
-            speech_error(sp->resp, 500, "out of memory");
+            http_error(sp->resp, 500, "out of memory");
     } else {
         spore_reply(sp->resp, 200, "audio/pcm", "", 0); /* no audio */
     }
@@ -1774,13 +1841,13 @@ static void on_speech(spore_req *req, spore_resp *resp, void *ud) {
     free(sp->text);
     free(sp->voice);
     free(sp);
-    speech_error(resp, 503, "server busy");
+    http_error(resp, 503, "server busy");
     return;
 fail:
     if (sp) free(sp->text);
     free(sp);
     spore_json_free(&d);
-    speech_error(resp, strcmp(err, "out of memory") ? 400 : 500, err);
+    http_error(resp, strcmp(err, "out of memory") ? 400 : 500, err);
 }
 
 spore_rt *spore_rt_new(spore_server *srv, const spore_rt_backend *be,

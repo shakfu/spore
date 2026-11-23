@@ -121,6 +121,13 @@ static int get_int(job *j, const spore_jnode *o, const char *key, long *out,
     return 0;
 }
 
+/* A field set to anything but null, false or 0. */
+static int wants(const spore_jnode *n) {
+    double v;
+    if (!n || n->type == SPORE_JNULL || n->type == SPORE_JFALSE) return 0;
+    return !(n->type == SPORE_JNUM && !spore_json_double(n, &v) && v == 0);
+}
+
 static int parse_sampling(job *j, const spore_jnode *o, const char **err) {
     const spore_json *d = &j->doc;
     spore_llm_params *p = &j->p;
@@ -161,7 +168,11 @@ static int parse_sampling(job *j, const spore_jnode *o, const char **err) {
     if (s && s->type != SPORE_JNULL && spore_json_bool(s, &j->stream))
         FAIL("'stream' must be a boolean");
     const spore_jnode *so = spore_json_get(d, o, "stream_options");
-    spore_json_bool(spore_json_get(d, so, "include_usage"), &j->include_usage);
+    if (so && so->type != SPORE_JNULL && so->type != SPORE_JOBJ)
+        FAIL("'stream_options' must be an object");
+    const spore_jnode *iu = spore_json_get(d, so, "include_usage");
+    if (iu && iu->type != SPORE_JNULL && spore_json_bool(iu, &j->include_usage))
+        FAIL("'stream_options.include_usage' must be a boolean");
 
     const spore_jnode *rf = spore_json_get(d, o, "reasoning_format");
     if (rf && rf->type == SPORE_JSTR && strcmp(rf->str, "none") == 0)
@@ -180,8 +191,19 @@ static int parse_sampling(job *j, const spore_jnode *o, const char **err) {
         FAIL("only response_format type \"text\" is supported");
 
     const spore_jnode *tools = spore_json_get(d, o, "tools");
-    if (tools && tools->type == SPORE_JARR && tools->len)
+    if (tools && tools->type != SPORE_JNULL &&
+        !(tools->type == SPORE_JARR && !tools->len))
         FAIL("tools are not supported");
+    /* "auto" without tools calls none, so only other choices are refused. */
+    const spore_jnode *tc = spore_json_get(d, o, "tool_choice");
+    if (tc && tc->type != SPORE_JNULL &&
+        !(tc->type == SPORE_JSTR && (!strcmp(tc->str, "none") ||
+                                     !strcmp(tc->str, "auto"))))
+        FAIL("tools are not supported");
+    /* Chat sends logprobs as a boolean, completions as a count. */
+    if (wants(spore_json_get(d, o, "logprobs")) ||
+        wants(spore_json_get(d, o, "top_logprobs")))
+        FAIL("logprobs are not supported");
     return 0;
 }
 

@@ -188,6 +188,13 @@ def test_content_parts_joined(srv):
         (chat("x", stop=[1]), "stop"),
         (chat("x", cache_prompt="yes"), "cache_prompt"),
         (chat("x", tools=[{"type": "function"}]), "tools"),
+        (chat("x", tools={}), "tools"),
+        (chat("x", tool_choice="required"), "tools"),
+        (chat("x", tool_choice={"type": "function", "function": {"name": "f"}}), "tools"),
+        (chat("x", logprobs=True), "logprobs"),
+        (chat("x", top_logprobs=2), "logprobs"),
+        (chat("x", stream_options={"include_usage": "true"}), "include_usage"),
+        (chat("x", stream_options=True), "stream_options"),
         (chat("x", stop=["\x00"]), "not valid JSON"),
         (chat("x", response_format={"type": "json_object"}), "response_format"),
         (chat("x", response_format="json"), "response_format"),
@@ -203,6 +210,19 @@ def test_invalid_requests(srv, payload, needle):
 
 def test_text_response_format_accepted(srv):
     assert post(srv, "/v1/chat/completions", chat("x", response_format={"type": "text"}))[0] == 200
+
+
+@pytest.mark.parametrize("extra", [{"logprobs": False}, {"logprobs": None}, {"top_logprobs": 0},
+                                   {"tools": []}, {"tool_choice": "none"}, {"tool_choice": "auto"},
+                                   {"stream_options": None}])
+def test_unused_features_left_off_are_accepted(srv, extra):
+    assert post(srv, "/v1/chat/completions", chat("x", **extra))[0] == 200
+
+
+def test_completion_logprobs_count_refused(srv):
+    assert post(srv, "/v1/completions", {"prompt": "x", "logprobs": 0})[0] == 200
+    status, r = post(srv, "/v1/completions", {"prompt": "x", "logprobs": 1})
+    assert status == 400 and "logprobs" in r["error"]["message"]
 
 
 def test_backend_error(srv):

@@ -670,7 +670,7 @@ static void dispatch(spore_server *s, conn *c, spore_req *req) {
             continue;
         req->tail = rt->prefix ? (spore_str){req->path.ptr + rt->plen,
                                              req->path.len - rt->plen}
-                               : (spore_str){req->path.ptr + req->path.len, 0};
+                               : (spore_str){NULL, 0};
         spore_resp *r = resp_new(s, req, keep);
         if (!r) {
             c->why = "memory";

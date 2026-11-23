@@ -57,6 +57,7 @@ typedef struct {
     const char *instructions; /* default system prompt; "" */
     const char *voice;        /* default voice; "marin" */
     int max_input_s;          /* input audio buffer cap in seconds; 600 */
+    int max_sessions;         /* concurrent sessions; 4. More get 503 */
 } spore_rt_config;
 
 /* Register GET /v1/realtime, and POST /v1/audio/speech when tts.fn is

@@ -62,3 +62,11 @@ build-*/
 __pycache__/
 .pytest_cache/
 deps/
+
+# agents
+.claude
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+REVIEW.md
+

@@ -237,6 +237,21 @@ def test_second_response_while_active_is_refused(rt):
     assert rt.until("response.done")[-1]["response"]["status"] == "cancelled"
 
 
+def test_response_created_before_refusing_a_second(rt):
+    # The worker is busy transcribing, so the response waits in the queue.
+    rt.send(type="session.update", session={"type": "realtime", "output_modalities": ["text"],
+                                            "audio": {"input": {"turn_detection": None}}})
+    rt.until("session.updated")
+    rt.append(silence(30000))
+    rt.send(type="input_audio_buffer.commit")
+    rt.send(type="response.create")
+    rt.send(type="response.create")
+    evs = rt.until("error")
+    assert evs[-1]["error"]["code"] == "conversation_already_has_active_response"
+    assert "response.created" in types(evs)
+    rt.until("response.done")
+
+
 def test_client_cancel(rt):
     rt.text_item("slow " * 40)
     rt.until("conversation.item.done")
@@ -275,6 +290,28 @@ def test_vad_turn_end_to_end(rt):
     # the echo LLM answers with the transcript, spoken
     transcript = "".join(e["delta"] for e in evs if e["type"] == "response.output_audio_transcript.delta")
     assert transcript == tr["transcript"]
+
+
+def test_announced_item_id_cannot_be_taken_by_client(rt):
+    rt.append(silence(500) + tone(400))
+    started = rt.until("input_audio_buffer.speech_started")[-1]
+    rt.send(type="conversation.item.create", item={"id": started["item_id"], "type": "message", "role": "user",
+                                                   "content": [{"type": "input_text", "text": "x"}]})
+    err = rt.until("error")[-1]["error"]
+    assert err["code"] == "invalid_value" and "exists" in err["message"]
+
+
+def test_clear_drops_the_announced_item_id(rt):
+    rt.append(silence(500) + tone(400))
+    started = rt.until("input_audio_buffer.speech_started")[-1]
+    rt.send(type="input_audio_buffer.clear")
+    rt.until("input_audio_buffer.cleared")
+    rt.send(type="session.update", session={"type": "realtime", "audio": {"input": {"turn_detection": None}}})
+    rt.until("session.updated")
+    rt.append(tone(300))
+    rt.send(type="input_audio_buffer.commit")
+    committed = rt.until("input_audio_buffer.committed")[-1]
+    assert committed["item_id"] != started["item_id"]
 
 
 def test_silence_alone_never_triggers(rt):
@@ -454,3 +491,25 @@ def test_disconnect_mid_response_then_new_session(srv):
     c2 = RT(srv)
     assert c2.recv()["type"] == "session.created"
     c2.close()
+
+
+def test_session_cap_refuses_then_frees(srv):
+    held = [RT(srv) for _ in range(4)]  # spore_rt_config.max_sessions default
+    for c in held:
+        assert c.recv()["type"] == "session.created"
+    with pytest.raises(InvalidStatus) as e:
+        RT(srv)
+    assert e.value.response.status_code == 503
+    assert json.loads(e.value.response.body)["error"]["code"] == 503
+    held.pop().close()
+    end = time.time() + 5  # the slot frees once the worker exits
+    while True:
+        try:
+            c = RT(srv)
+            break
+        except InvalidStatus:
+            assert time.time() < end
+            time.sleep(0.05)
+    assert c.recv()["type"] == "session.created"
+    for c in [c, *held]:
+        c.close()

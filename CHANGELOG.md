@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `spore_serve_dir()` on an exact route served the root directory and answered `GET /index.html` with a redirect to `/index.html/`. An exact route set `req->tail` to a non-NULL empty span, so the `req->path` fallback never ran. `req->tail.ptr` is now NULL on exact routes.
+
+- `spore_rt_config.max_sessions` (default 4) caps concurrent realtime sessions; a further `GET /v1/realtime` gets 503 before the upgrade. Before, each connection started a session and a thread, and each session can peak at about 125 MB while transcribing 600 s of input. A 503 was chosen over accepting and closing with WebSocket 1013: it costs no session state, and the SDK reports it as a failed connect.
+
+- Realtime: `response.created` is sent when a response is accepted, not when the session worker starts it. A response queued behind a transcription had no `response.created`, so a second `response.create` was refused with `conversation_already_has_active_response` for a response the client had not seen.
+
+- Realtime: client events are parsed, and appended audio is base64-decoded, before the session lock is taken. A 16 MiB append held the lock for the whole parse, and audio and text deltas, which need the lock, waited.
+
+- `spore_llm` refuses with 400 the features it cannot serve, instead of ignoring them: `logprobs` and `top_logprobs` set to anything but null, false or 0; `tools` that is not an empty array; and `tool_choice` other than `"none"` or `"auto"`. A malformed `stream_options` or `include_usage` is also 400; before, it silently dropped the usage chunk.
+
+- Realtime: a client item can no longer take an id the server has announced, such as the `item_id` of `speech_started` or of the active response, and server ids skip ids clients already use. Before, a client could pre-create the next server id, and transcripts, deletes and truncates then reached the client's item. `input_audio_buffer.clear` now drops the announced id, so a later commit no longer reuses it. Errors with code `server_error` now have `type: "server_error"`.
+
 ## [0.2.0]
 
 - The C API and ABI may change in any 0.x release (README, "Library use"). Tool calls, for one, will extend `spore_llm_msg` and the emit callback.
